@@ -5,7 +5,7 @@ venv/
 .venv/
 logs/
 reports/
-
+database/*.db
 bank_statement_may.csv
 
 .DS_Store
