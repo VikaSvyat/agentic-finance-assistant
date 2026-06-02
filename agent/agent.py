@@ -21,6 +21,7 @@
 import os
 import json
 import logging
+from pathlib import Path
 from dotenv import load_dotenv
 
 from agent.llm import call_llm
@@ -50,16 +51,26 @@ CRITICAL OUTPUT RULES:
 - Do NOT plan all steps at once.
 
 WORKFLOW RULES:
-- Use Finance MCP tools to analyze the statement.
+- If the user provides a statements directory, first use filesystem tools to inspect the directory.
+- Use filesystem.list_directory or a similar filesystem tool to discover CSV files.
+- Then call finance.merge_statements to merge the discovered CSV files into one combined CSV.
+- After finance.merge_statements, use the existing single-file Finance MCP tools on the merged CSV.
 - Use finance.analyze_statement for the main summary.
 - Use finance.find_unusual_expenses for large expenses to review.
 - Use finance.generate_savings_advice for advice.
 - Before final_answer, call finance.generate_monthly_report.
+- After finance.generate_monthly_report, if SQLite tools are available, call finance.prepare_monthly_report_record.
+- Then call sqlite.create_record to save the prepared monthly report record.
+- Only after saving, return final_answer.
 - Never invent financial numbers yourself.
 - Never create a final report from memory.
 - Always base the final answer on tool outputs.
 
 IMPORTANT DATA PASSING RULE:
+- If you need to call finance.merge_statements, you may pass an empty list as csv_files.
+- The system will automatically inject CSV files discovered from filesystem tools.
+- If you need to call finance.analyze_statement or finance.find_unusual_expenses after merging, you may pass an empty csv_path.
+- The system will automatically inject the merged CSV path returned by finance.merge_statements.
 - If you need to call finance.generate_monthly_report, you may pass empty strings as args.
 - The system will automatically inject the latest outputs from:
   - finance.analyze_statement
@@ -78,11 +89,15 @@ When finished, return exactly:
 
 {
   "tool": "final_answer",
-  "args": {
-    "answer": "final user-facing report"
-  },
+  "args": {},
   "reason": "task completed"
 }
+
+IMPORTANT FINAL ANSWER RULE:
+- Do NOT put the monthly report inside the final_answer JSON.
+- Do NOT include markdown report text in args.answer.
+- The system already has the full monthly report in memory.
+- final_answer is only a signal that the workflow is complete.
 """
 
 ### This function turns the list of MCP tools into short text for LLM. 
@@ -105,7 +120,7 @@ def tools_to_text(tools: dict) -> str:
 
         lines.append(
             f"Tool: {name}\n"
-            f"Description: {description[:250]}\n"
+            f"Description: {description[:80]}\n"
             f"Args: {arg_names}\n"
         )
 
@@ -134,6 +149,91 @@ def extract_json(text: str) -> dict:
 ### It saves the full result of tool into Python's internal memory.
 # Because in LLM we only send a preview 
 # # and the full result remains inside Python and is then passed to the next tool.
+
+def extract_csv_paths_from_filesystem_output(result: str, statements_dir: str = "") -> list[str]:
+    """
+    Extract CSV file paths from common filesystem MCP outputs.
+
+    Supports:
+    - JSON lists
+    - JSON objects with entries/files/items
+    - dict items with path/name/file/filename
+    - plain text directory listings
+    """
+
+    csv_files = []
+
+    def normalize_path(value: str) -> str:
+        value = str(value).strip().strip('"').strip("'")
+
+        if not value.lower().endswith(".csv"):
+            return ""
+
+        # already absolute path
+        if value.startswith("/"):
+            return value
+
+        # already contains directory
+        if "/" in value:
+            return value
+
+        # discovered file name only
+        if statements_dir:
+            return str(Path(statements_dir) / value)
+
+        # fallback for current project structure
+        return str(Path("data") / value)
+
+    try:
+        data = json.loads(result)
+
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = data.get("entries") or data.get("files") or data.get("items") or []
+        else:
+            items = []
+
+        for item in items:
+            if isinstance(item, str):
+                path = normalize_path(item)
+                if path:
+                    csv_files.append(path)
+            elif isinstance(item, dict):
+                candidate = (
+                    item.get("path")
+                    or item.get("name")
+                    or item.get("file")
+                    or item.get("filename")
+                )
+                if candidate:
+                    path = normalize_path(candidate)
+                    if path:
+                        csv_files.append(path)
+
+    except Exception:
+        for line in str(result).splitlines():
+            line = line.strip()
+
+            # Filesystem MCP often returns lines like:
+            # [FILE] bank_statement_may.csv
+            # [DIR] statements
+            if line.startswith("[DIR]"):
+                continue
+
+            if line.startswith("[FILE]"):
+                line = line.replace("[FILE]", "", 1).strip()
+
+            line = line.strip("-").strip()
+
+            path = normalize_path(line)
+
+            if path:
+                csv_files.append(path)
+
+    return list(dict.fromkeys(csv_files))
+
+
 def remember_tool_output(tool_name: str, result: str, memory: dict) -> None:
     """
     Store full tool outputs internally.
@@ -152,19 +252,59 @@ def remember_tool_output(tool_name: str, result: str, memory: dict) -> None:
     elif tool_name == "finance.generate_monthly_report":
         memory["monthly_report"] = result
 
+    elif tool_name == "finance.prepare_monthly_report_record":
+        memory["monthly_report_record"] = result
+
+    elif tool_name == "finance.merge_statements":
+        try:
+            data = json.loads(result)
+            merged_path = data.get("merged_csv_path") or data.get("csv_path")
+            if merged_path:
+                memory["csv_path"] = merged_path
+                memory["merged_csv_path"] = merged_path
+        except Exception:
+            pass
+
+    elif tool_name.startswith("filesystem."):
+        memory.setdefault("filesystem_outputs", []).append(result)
+        discovered = extract_csv_paths_from_filesystem_output(
+            result,
+            memory.get("statements_dir", ""),
+        )
+        if discovered:
+            existing = memory.get("csv_files", [])
+            memory["csv_files"] = list(dict.fromkeys(existing + discovered))
+
+def normalize_args(args) -> dict:
+    """
+    Ensure tool args are always a dictionary.
+    The LLM may accidentally return a list or a string.
+    """
+    if args is None:
+        return {}
+
+    if isinstance(args, dict):
+        return args
+
+    if isinstance(args, list):
+        return {"csv_files": args}
+
+    if isinstance(args, str):
+        return {"path": args}
+
+    return {}
+
 ### This function fixes the arguments before calling tool.
 # LLM selects a tool, but may make a mistake in its arguments.
+
 def build_args_for_tool(tool_name: str, args: dict, csv_path: str, memory: dict) -> dict:
     """
     Fix or enrich tool args before execution.
-
-    The LLM chooses the tool, but this function prevents common mistakes:
-    - passing file paths instead of JSON outputs
-    - forgetting csv_path
-    - trying to generate a report without real previous tool outputs
     """
 
-    args = dict(args or {})
+    args = normalize_args(args)
+
+    effective_csv_path = memory.get("csv_path") or csv_path
 
     finance_csv_tools = {
         "finance.analyze_statement",
@@ -175,93 +315,79 @@ def build_args_for_tool(tool_name: str, args: dict, csv_path: str, memory: dict)
     }
 
     if tool_name in finance_csv_tools:
-        args["csv_path"] = csv_path
+        args["csv_path"] = effective_csv_path
+
+    if tool_name in {
+        "filesystem.list_directory",
+        "filesystem.list_directory_with_sizes",
+    }:
+        path = args.get("path")
+
+        if not path:
+            if args.get("csv_files") and isinstance(args["csv_files"], list):
+                path = args["csv_files"][0]
+            elif memory.get("statements_dir"):
+                path = memory["statements_dir"]
+            elif csv_path:
+                path = str(Path(csv_path).parent)
+            else:
+                path = "data"
+
+        args = {"path": path}
+
+    if tool_name == "finance.merge_statements":
+        if not args.get("csv_files"):
+            args["csv_files"] = memory.get("csv_files", [])
+
+        args["output_csv_path"] = str(Path("data") / "merged_statement.csv")
 
     if tool_name == "finance.generate_savings_advice":
         args["analysis_json"] = memory.get("analysis_json", "")
         args["unusual_json"] = memory.get("unusual_json", "")
-
 
     if tool_name == "finance.generate_monthly_report":
         args["analysis_json"] = memory.get("analysis_json", "")
         args["unusual_json"] = memory.get("unusual_json", "")
         args["advice_text"] = memory.get("advice_text", "")
 
+    if tool_name == "finance.prepare_monthly_report_record":
+        args["analysis_json"] = memory.get("analysis_json", "")
+        args["unusual_json"] = memory.get("unusual_json", "")
+        args["advice_text"] = memory.get("advice_text", "")
+        args["monthly_report"] = memory.get("monthly_report", "")
+
+    if tool_name == "sqlite.create_record" and memory.get("monthly_report_record"):
+        record = json.loads(memory["monthly_report_record"])
+        args["table"] = record["table"]
+        args["data"] = record["data"]
+
     return args
-
-def build_sqlite_create_table_args() -> dict:
-    return {
-        "sql": """
-CREATE TABLE IF NOT EXISTS monthly_reports (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at TEXT NOT NULL,
-    total_spent REAL,
-    transactions_count INTEGER,
-    average_transaction REAL,
-    analysis_json TEXT NOT NULL,
-    unusual_json TEXT NOT NULL,
-    advice_text TEXT NOT NULL,
-    monthly_report TEXT NOT NULL
-)
-"""
-    }
-
-
-def build_sqlite_insert_args(memory: dict) -> dict:
-    analysis = json.loads(memory.get("analysis_json", "{}"))
-
-    return {
-        "table": "monthly_reports",
-        "data": {
-            "created_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
-            "total_spent": analysis.get("total_spent"),
-            "transactions_count": analysis.get("transactions_count"),
-            "average_transaction": analysis.get("average_transaction"),
-            "analysis_json": memory.get("analysis_json", ""),
-            "unusual_json": memory.get("unusual_json", ""),
-            "advice_text": memory.get("advice_text", ""),
-            "monthly_report": memory.get("monthly_report", ""),
-        },
-    }
-
-def build_sqlite_create_categories_table_args() -> dict:
-    return {
-        "sql": """
-CREATE TABLE IF NOT EXISTS monthly_category_summaries (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    report_id INTEGER,
-    created_at TEXT NOT NULL,
-    category TEXT NOT NULL,
-    category_en TEXT NOT NULL,
-    total_amount REAL,
-    transactions_count INTEGER,
-    average_transaction REAL
-)
-"""
-    }
-
-def build_sqlite_category_insert_args(memory: dict, category: dict, report_id=None) -> dict:
-    return {
-        "table": "monthly_category_summaries",
-        "data": {
-            "report_id": report_id,
-            "created_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
-            "category": category.get("category"),
-            "category_en": category.get("category_en"),
-            "total_amount": category.get("total_amount"),
-            "transactions_count": category.get("transactions_count"),
-            "average_transaction": category.get("average_transaction"),
-        },
-    }
 
 ### This function checks whether tool can already be called.
 # LLM plans. Python controls correctness
 def missing_required_memory_for_tool(tool_name: str, memory: dict) -> list:
     """
-    Check whether we already have the tool outputs needed by derived tools.
+    Check whether the selected tool already has the outputs it needs.
+    The LLM still decides the next step; Python only validates dependencies.
     """
 
     missing = []
+
+    finance_csv_tools = {
+        "finance.analyze_statement",
+        "finance.get_category_breakdown",
+        "finance.get_top_merchants",
+        "finance.find_unusual_expenses",
+        "finance.categorize_transactions",
+    }
+
+    if tool_name == "finance.merge_statements":
+        if not memory.get("csv_files"):
+            missing.append("filesystem.list_directory")
+
+    if tool_name in finance_csv_tools:
+        if memory.get("statements_dir") and not memory.get("csv_path"):
+            missing.append("finance.merge_statements")
 
     if tool_name == "finance.generate_savings_advice":
         if not memory.get("analysis_json"):
@@ -276,6 +402,20 @@ def missing_required_memory_for_tool(tool_name: str, memory: dict) -> list:
             missing.append("finance.find_unusual_expenses")
         if not memory.get("advice_text"):
             missing.append("finance.generate_savings_advice")
+
+    if tool_name == "finance.prepare_monthly_report_record":
+        if not memory.get("analysis_json"):
+            missing.append("finance.analyze_statement")
+        if not memory.get("unusual_json"):
+            missing.append("finance.find_unusual_expenses")
+        if not memory.get("advice_text"):
+            missing.append("finance.generate_savings_advice")
+        if not memory.get("monthly_report"):
+            missing.append("finance.generate_monthly_report")
+
+    if tool_name == "sqlite.create_record":
+        if not memory.get("monthly_report_record"):
+            missing.append("finance.prepare_monthly_report_record")
 
     return missing
 
@@ -299,14 +439,21 @@ def make_observation(tool_name: str, result: str, ok: bool = True, error: str | 
     return {
         "tool": tool_name,
         "ok": True,
-        "output_preview": str(result)[:1200],
+        "output_preview": str(result)[:120],
+        "full_output": str(result),
     }
 
 
-async def run_agent(user_goal: str, csv_path: str):
+async def run_agent(user_goal: str, csv_path: str = "", statements_dir: str = ""):
     manager = MCPManager()
     steps = []
     memory = {}
+
+    if csv_path:
+        memory["csv_path"] = csv_path
+
+    if statements_dir:
+        memory["statements_dir"] = statements_dir
 
     try:
         tools = await manager.connect()
@@ -319,13 +466,19 @@ User goal:
 CSV path to analyze:
 {csv_path}
 
+Statements directory to analyze:
+{statements_dir}
+
 Required final result:
-- analyze the bank statement
-- find large expenses to review
-- generate savings advice
-- generate a clean monthly report
-- save the report to a markdown file if filesystem tools are available
-- save monthly summary to SQLite if SQLite tools are available
+- If statements_dir is provided, first discover CSV files using filesystem tools.
+- Then call finance.merge_statements to create one merged CSV.
+- Analyze the merged CSV using the existing finance.analyze_statement tool.
+- If only csv_path is provided, analyze the single bank statement.
+- Find large expenses to review.
+- Generate savings advice.
+- Generate a clean monthly report.
+- Save the report to a markdown file if filesystem tools are available.
+- Save monthly summary to SQLite if SQLite tools are available by calling finance.prepare_monthly_report_record and then sqlite.create_record.
 
 Important:
 The final answer must be the report returned by finance.generate_monthly_report.
@@ -344,7 +497,7 @@ Available tools:
             },
         ]
 
-        for step_number in range(1, 11):
+        for step_number in range(1, 15):
             llm_text = call_llm(messages)
 
             try:
@@ -517,139 +670,12 @@ Continue. Choose ONE missing tool first.
                     ok=True,
                 )
 
-                if tool_name == "finance.generate_monthly_report":
-                    steps.append(
-                        {
-                            "step": step_number,
-                            "tool": tool_name,
-                            "args": args,
-                            "reason": reason,
-                            "observation": observation,
-                        }
-                    )
-
-                    if "sqlite.query" in tools and "sqlite.create_record" in tools:
-                        try:
-                            # 1. Create monthly_reports table
-                            create_table_args = build_sqlite_create_table_args()
-                            create_table_result = await manager.call_tool(
-                                "sqlite.query",
-                                create_table_args,
-                            )
-
-                            steps.append(
-                                {
-                                    "step": step_number + 0.1,
-                                    "tool": "sqlite.query",
-                                    "args": create_table_args,
-                                    "reason": "Create monthly_reports table if it does not exist",
-                                    "observation": make_observation(
-                                        "sqlite.query",
-                                        str(create_table_result),
-                                        ok=True,
-                                    ),
-                                }
-                            )
-
-                            # 2. Save main monthly report
-                            insert_args = build_sqlite_insert_args(memory)
-                            insert_result = await manager.call_tool(
-                                "sqlite.create_record",
-                                insert_args,
-                            )
-
-                            steps.append(
-                                {
-                                    "step": step_number + 0.2,
-                                    "tool": "sqlite.create_record",
-                                    "args": insert_args,
-                                    "reason": "Save monthly finance report to SQLite",
-                                    "observation": make_observation(
-                                        "sqlite.create_record",
-                                        str(insert_result),
-                                        ok=True,
-                                    ),
-                                }
-                            )
-
-                            # 3. Create monthly_category_summaries table
-                            create_categories_table_args = build_sqlite_create_categories_table_args()
-                            create_categories_table_result = await manager.call_tool(
-                                "sqlite.query",
-                                create_categories_table_args,
-                            )
-
-                            steps.append(
-                                {
-                                    "step": step_number + 0.3,
-                                    "tool": "sqlite.query",
-                                    "args": create_categories_table_args,
-                                    "reason": "Create monthly_category_summaries table if it does not exist",
-                                    "observation": make_observation(
-                                        "sqlite.query",
-                                        str(create_categories_table_result),
-                                        ok=True,
-                                    ),
-                                }
-                            )
-
-                            # 4. Save category summaries
-                            analysis = json.loads(memory.get("analysis_json", "{}"))
-                            categories = analysis.get("top_categories", [])
-
-                            saved_categories_count = 0
-
-                            for category in categories:
-                                category_insert_args = build_sqlite_category_insert_args(
-                                    memory=memory,
-                                    category=category,
-                                    report_id=None,
-                                )
-
-                                await manager.call_tool(
-                                    "sqlite.create_record",
-                                    category_insert_args,
-                                )
-
-                                saved_categories_count += 1
-
-                            steps.append(
-                                {
-                                    "step": f"{step_number}.DB",
-                                    "tool": "sqlite.save_category_summaries",
-                                    "reason": "Save monthly category summaries to SQLite",
-                                    "observation": {
-                                        "tool": "sqlite.create_record",
-                                        "ok": True,
-                                        "saved_categories_count": saved_categories_count,
-                                    },
-                                }
-                            )
-
-                        except Exception as e:
-                            steps.append(
-                                {
-                                    "step": step_number + 0.9,
-                                    "tool": "sqlite.save_failed",
-                                    "reason": "SQLite persistence failed",
-                                    "observation": make_observation(
-                                        "sqlite",
-                                        "",
-                                        ok=False,
-                                        error=str(e),
-                                    ),
-                                }
-                            )
-
-                    return {
-                        "answer": memory["monthly_report"],
-                        "steps": steps,
-                    }
-
-                    return {
-                        "answer": memory["monthly_report"],
-                        "steps": steps,
-                    }
+            llm_observation = {
+                "tool": observation.get("tool"),
+                "ok": observation.get("ok"),
+                "output_preview": observation.get("output_preview", ""),
+                "error": observation.get("error", ""),
+            }
 
             logging.info(
                 "RESULT tool=%s output=%s",
@@ -672,18 +698,22 @@ Continue. Choose ONE missing tool first.
                     "role": "user",
                     "content": f"""
 Tool observation:
-{json.dumps(observation, ensure_ascii=False)}
+{json.dumps(llm_observation, ensure_ascii=False)}
 
 Internal state:
 - analysis_json available: {bool(memory.get("analysis_json"))}
 - unusual_json available: {bool(memory.get("unusual_json"))}
 - advice_text available: {bool(memory.get("advice_text"))}
 - monthly_report available: {bool(memory.get("monthly_report"))}
+- discovered csv_files count: {len(memory.get("csv_files", []))}
+- effective csv_path available: {bool(memory.get("csv_path") or csv_path)}
 
 Continue. Choose exactly ONE next tool or final_answer.
 """,
                 }
             )
+            # Keep prompt small for Groq TPM limits
+            messages = messages[:2] + messages[-4:]
 
         if memory.get("monthly_report"):
             return {

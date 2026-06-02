@@ -12,6 +12,19 @@ def load_bank_csv(csv_path: str) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"File not found: {csv_path}")
 
+    preview = pd.read_csv(path, sep=None, engine="python", nrows=5)
+
+    normalized_required = {"transaction_date", "merchant", "category", "amount"}
+
+    if normalized_required.issubset(set(preview.columns)):
+        df = pd.read_csv(path, sep=None, engine="python")
+
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+        df = df.dropna(subset=["amount"])
+        df = df[df["merchant"].notna()]
+
+        return df
+    
     raw = pd.read_csv(path, sep=";", header=None)
 
     header_row = None
@@ -333,7 +346,7 @@ def generate_monthly_report(analysis_json: str, unusual_json: str, advice_text: 
     large_expenses = unusual.get("large_expenses_to_review", [])
 
     lines.append("")
-    lines.append("## Large Expenses to Review")
+    lines.append("## Large or Unusial Expenses to Review")
     if large_expenses:
         for item in large_expenses[:5]:
             lines.append(
@@ -353,9 +366,10 @@ def generate_monthly_report(analysis_json: str, unusual_json: str, advice_text: 
 @mcp.tool()
 def find_unusual_expenses(csv_path: str) -> str:
     """
-    Find large expenses to review using merchant-specific thresholds first,
+    Find large or unusial expenses to review using merchant-specific thresholds first,
     then normalized-category fallback.
     """
+    MIN_LARGE_EXPENSE_NIS = 200
 
     df = load_bank_csv(csv_path)
     df = add_normalized_categories(df)
@@ -417,7 +431,10 @@ def find_unusual_expenses(csv_path: str) -> str:
     df["threshold"] = df.apply(get_threshold, axis=1)
     df["threshold_method"] = df.apply(get_method, axis=1)
 
-    unusual = df[df["amount"] > df["threshold"]].copy()
+    unusual = df[
+        (df["amount"] > df["threshold"]) &
+        (df["amount"] >= MIN_LARGE_EXPENSE_NIS)
+    ].copy()
 
     unusual = unusual[
         [
@@ -509,7 +526,7 @@ def generate_savings_advice(analysis_json: str, unusual_json: str) -> str:
 
     if large_expenses:
         advice.append("")
-        advice.append("Large expenses to review:")
+        advice.append("Large or unusial expenses to review:")
         for item in large_expenses[:5]:
             advice.append(
                 f"- {item.get('transaction_date')}: {item.get('merchant')} — "
@@ -520,6 +537,144 @@ def generate_savings_advice(analysis_json: str, unusual_json: str) -> str:
     advice.append("Suggested next step: set monthly budget limits for the top 3 normalized categories.")
 
     return "\n".join(advice)
+
+
+
+@mcp.tool()
+def prepare_monthly_report_record(
+    analysis_json: str,
+    unusual_json: str,
+    advice_text: str,
+    monthly_report: str,
+) -> str:
+    """
+    Prepare a clean monthly report record for saving to SQLite.
+
+    This tool does not save anything by itself.
+    It only prepares the table name and data payload.
+    The LLM should call sqlite.create_record after this tool.
+    """
+
+    from datetime import datetime
+
+    if not analysis_json or not analysis_json.strip():
+        return json.dumps(
+            {"error": "analysis_json is empty. Call finance.analyze_statement first."},
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    if not unusual_json or not unusual_json.strip():
+        return json.dumps(
+            {"error": "unusual_json is empty. Call finance.find_unusual_expenses first."},
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    if not advice_text or not advice_text.strip():
+        return json.dumps(
+            {"error": "advice_text is empty. Call finance.generate_savings_advice first."},
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    if not monthly_report or not monthly_report.strip():
+        return json.dumps(
+            {"error": "monthly_report is empty. Call finance.generate_monthly_report first."},
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    analysis = json.loads(analysis_json)
+
+    result = {
+        "table": "monthly_reports",
+        "data": {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "total_spent": analysis.get("total_spent"),
+            "transactions_count": analysis.get("transactions_count"),
+            "average_transaction": analysis.get("average_transaction"),
+            "analysis_json": analysis_json,
+            "unusual_json": unusual_json,
+            "advice_text": advice_text,
+            "monthly_report": monthly_report,
+        },
+    }
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+def load_multiple_bank_csvs(csv_files: list[str]) -> pd.DataFrame:
+    """
+    Load and combine several bank/card CSV statements into one DataFrame.
+
+    Reuses the existing load_bank_csv() function, so each input file is normalized
+    exactly like a single-file statement. Adds source_id from the last 4 card digits
+    when available, otherwise infers it from the file name.
+    """
+
+    frames = []
+
+    for csv_path in csv_files:
+        df = load_bank_csv(csv_path)
+        df = df.copy()
+
+        source_name = Path(csv_path).stem
+
+        if "card_last_4" in df.columns:
+            df["source_id"] = (
+                df["card_last_4"]
+                .astype(str)
+                .str.extract(r"(\d{4})", expand=False)
+            )
+        else:
+            df["source_id"] = None
+
+        inferred = pd.Series([source_name]).str.extract(r"(\d{4})", expand=False).iloc[0]
+        if not inferred:
+            inferred = source_name
+
+        df["source_id"] = df["source_id"].fillna(str(inferred))
+        df["source_file"] = source_name
+
+        frames.append(df)
+
+    if not frames:
+        raise ValueError("No CSV files were provided")
+
+    return pd.concat(frames, ignore_index=True)
+
+
+@mcp.tool()
+def merge_statements(csv_files: list[str], output_csv_path: str = "data/merged_statement.csv") -> str:
+    """
+    Merge several bank/card CSV statements into one normalized CSV file.
+
+    This tool does not analyze the data. It only prepares a combined CSV that can be
+    passed to the existing finance.analyze_statement and finance.find_unusual_expenses tools.
+    """
+
+    if not csv_files:
+        return json.dumps(
+            {"error": "csv_files is empty. Discover files with filesystem tools first."},
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    df = load_multiple_bank_csvs(csv_files)
+
+    output_path = Path(output_csv_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output_path, index=False)
+
+    result = {
+        "merged_csv_path": str(output_path),
+        "input_files": csv_files,
+        "files_count": len(csv_files),
+        "rows_count": int(len(df)),
+        "sources_count": int(df["source_id"].nunique()) if "source_id" in df.columns else None,
+    }
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":
