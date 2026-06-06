@@ -1,12 +1,51 @@
 from mcp.server.fastmcp import FastMCP
 import pandas as pd
 import json
+import os
 from pathlib import Path
 
 mcp = FastMCP("finance-mcp")
 
+FINANCE_CACHE_ENABLED = os.getenv("FINANCE_CACHE_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+FINANCE_CACHE_MAX_ENTRIES = int(os.getenv("FINANCE_CACHE_MAX_ENTRIES", "16"))
 
-def load_bank_csv(csv_path: str) -> pd.DataFrame:
+_RAW_STATEMENT_CACHE: dict[tuple[str, int, int], pd.DataFrame] = {}
+_NORMALIZED_STATEMENT_CACHE: dict[tuple[str, int, int], pd.DataFrame] = {}
+
+
+def file_cache_key(csv_path: str) -> tuple[str, int, int]:
+    path = Path(csv_path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {csv_path}")
+
+    stat = path.stat()
+
+    return (
+        str(path.resolve()),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+    )
+
+
+def remember_cached_frame(
+    cache: dict[tuple[str, int, int], pd.DataFrame],
+    key: tuple[str, int, int],
+    df: pd.DataFrame,
+) -> None:
+    cache[key] = df.copy(deep=True)
+
+    while len(cache) > FINANCE_CACHE_MAX_ENTRIES:
+        oldest_key = next(iter(cache))
+        cache.pop(oldest_key, None)
+
+
+def load_bank_csv_uncached(csv_path: str) -> pd.DataFrame:
     path = Path(csv_path)
 
     if not path.exists():
@@ -76,6 +115,30 @@ def load_bank_csv(csv_path: str) -> pd.DataFrame:
     df = df[df["merchant"].notna()]
 
     return df
+
+
+def load_bank_csv(csv_path: str) -> pd.DataFrame:
+    """
+    Load a statement CSV with a small in-process cache.
+
+    Cache keys include path, file size, and mtime, so changed files are
+    automatically parsed again. Callers receive a copy to protect cached data.
+    """
+
+    if not FINANCE_CACHE_ENABLED:
+        return load_bank_csv_uncached(csv_path)
+
+    key = file_cache_key(csv_path)
+
+    if key not in _RAW_STATEMENT_CACHE:
+        remember_cached_frame(
+            _RAW_STATEMENT_CACHE,
+            key,
+            load_bank_csv_uncached(csv_path),
+        )
+
+    return _RAW_STATEMENT_CACHE[key].copy(deep=True)
+
 
 def add_normalized_categories(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -157,14 +220,36 @@ def add_normalized_categories(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+
+def load_normalized_bank_csv(csv_path: str) -> pd.DataFrame:
+    """
+    Load a statement and add normalized categories with caching.
+
+    This avoids repeating both CSV parsing and category normalization across
+    tools such as analyze_statement and find_unusual_expenses in the same run.
+    """
+
+    if not FINANCE_CACHE_ENABLED:
+        return add_normalized_categories(load_bank_csv_uncached(csv_path))
+
+    key = file_cache_key(csv_path)
+
+    if key not in _NORMALIZED_STATEMENT_CACHE:
+        remember_cached_frame(
+            _NORMALIZED_STATEMENT_CACHE,
+            key,
+            add_normalized_categories(load_bank_csv(csv_path)),
+        )
+
+    return _NORMALIZED_STATEMENT_CACHE[key].copy(deep=True)
+
 @mcp.tool()
 def categorize_transactions(csv_path: str) -> str:
     """
     Return transactions with original bank category and normalized category.
     """
 
-    df = load_bank_csv(csv_path)
-    df = add_normalized_categories(df)
+    df = load_normalized_bank_csv(csv_path)
 
     result = df[
         [
@@ -188,9 +273,7 @@ def analyze_statement(csv_path: str) -> str:
     Categories are shown in Hebrew and English.
     """
 
-    df = load_bank_csv(csv_path)
-
-    df = add_normalized_categories(df)
+    df = load_normalized_bank_csv(csv_path)
 
     category_translation = {
         "מזון וצריכה": "Food and groceries",
@@ -265,8 +348,7 @@ def get_category_breakdown(csv_path: str) -> str:
     Return spending grouped by normalized category.
     """
 
-    df = load_bank_csv(csv_path)
-    df = add_normalized_categories(df)
+    df = load_normalized_bank_csv(csv_path)
 
     grouped = (
         df.groupby(["normalized_category", "normalized_category_en"])["amount"]
@@ -371,8 +453,7 @@ def find_unusual_expenses(csv_path: str) -> str:
     """
     MIN_LARGE_EXPENSE_NIS = 200
 
-    df = load_bank_csv(csv_path)
-    df = add_normalized_categories(df)
+    df = load_normalized_bank_csv(csv_path)
     df = df.copy()
 
     min_merchant_transactions = 3

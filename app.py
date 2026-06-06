@@ -10,6 +10,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from agent.agent import run_agent
+from agent.config import MAX_TRACE_OUTPUT_LENGTH
 
 load_dotenv()
 
@@ -137,6 +138,35 @@ def kpi_card(label, value):
         <div class="kpi-value">{value}</div>
     </div>
     """, unsafe_allow_html=True)
+
+
+def truncate_trace_value(value, limit=MAX_TRACE_OUTPUT_LENGTH):
+    text = str(value)
+
+    if len(text) <= limit:
+        return value
+
+    omitted = len(text) - limit
+    return f"{text[:limit]}\n... [truncated {omitted} chars]"
+
+
+def truncate_trace_payload(value):
+    if isinstance(value, dict):
+        return {
+            key: truncate_trace_payload(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, list):
+        return [
+            truncate_trace_payload(item)
+            for item in value
+        ]
+
+    if isinstance(value, str):
+        return truncate_trace_value(value)
+
+    return value
 
 
 def prepare_categories_df(analysis):
@@ -287,10 +317,14 @@ if st.button("🚀 Run Agent", disabled=not can_run):
             rows = []
             for step in steps:
                 obs = step.get("observation", {})
+                timing = step.get("timing", {})
                 rows.append({
                     "Step": step.get("step"),
                     "Tool": step.get("tool"),
                     "Status": step_status(step),
+                    "LLM (s)": timing.get("llm_response_seconds", ""),
+                    "Tool (s)": timing.get("tool_execution_seconds", ""),
+                    "Total (s)": timing.get("total_step_seconds", ""),
                     "Reason": step.get("reason", ""),
                     "Error": obs.get("error", "") if isinstance(obs, dict) else "",
                 })
@@ -306,15 +340,15 @@ if st.button("🚀 Run Agent", disabled=not can_run):
 
                     if "args" in step:
                         st.write("Args:")
-                        st.json(step["args"])
+                        st.json(truncate_trace_payload(step["args"]))
 
                     if "observation" in step:
                         st.write("Observation:")
-                        st.json(step["observation"])
+                        st.json(truncate_trace_payload(step["observation"]))
 
                     if "output" in step:
                         st.write("Output:")
-                        st.markdown(str(step["output"]))
+                        st.markdown(truncate_trace_value(step["output"]))
 else:
     if input_mode == "Single CSV":
         st.info("Upload a CSV file first.")

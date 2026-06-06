@@ -1,152 +1,359 @@
 # Finance MCP Agent
 
-An agentic AI application that analyzes bank statements using the Model Context Protocol (MCP).
+An agentic finance dashboard that analyzes bank/card statements through MCP tools.
 
-The project demonstrates how an LLM can orchestrate multiple MCP servers to perform financial analysis, generate insights, create reports, and persist results in SQLite.
+The app uses a Streamlit UI, an LLM-driven agent loop, and multiple MCP servers. The LLM decides which tool to call next, while deterministic Python/MCP tools do the actual data loading, calculations, report generation, filesystem work, and SQLite persistence.
 
-## Features
+## What It Does
 
-### Finance MCP Server
-
-Custom MCP server providing financial analysis tools:
-
-* Analyze monthly bank statements
-* Categorize transactions
-* Detect unusual expenses
-* Generate savings advice
-* Generate monthly financial reports
-
-### Filesystem MCP
-
-Uses the official MCP Filesystem Server to:
-
-* Read files
-* Write reports
-* Manage report storage
-
-### SQLite MCP
-
-Uses the official MCP SQLite Server to:
-
-* Store monthly reports
-* Store category summaries
-* Persist historical financial data
-
-### Agent Orchestration
-
-The agent automatically:
-
-1. Analyzes a statement
-2. Detects unusual expenses
-3. Generates savings advice
-4. Creates a monthly report
-5. Saves report metadata to SQLite
-
-The LLM decides which tool to call next and executes one action at a time.
+- Analyze a single uploaded CSV statement.
+- Analyze a directory of CSV statements as one combined financial view.
+- Discover CSV files through the Filesystem MCP server.
+- Merge multiple statements into `data/merged_statement.csv`.
+- Normalize Hebrew bank/card statement columns into a common schema.
+- Normalize spending categories, including splitting broad utility categories into fuel, electricity, gas, and utilities.
+- Calculate total spending, transaction count, average transaction, top categories, and top merchants.
+- Detect large or unusual expenses using merchant/category percentile thresholds.
+- Generate savings advice from analysis outputs.
+- Generate a clean monthly markdown report.
+- Prepare and save monthly report data to SQLite through MCP.
+- Show a technical agent trace in the Streamlit UI.
 
 ## Architecture
 
 ```text
 Streamlit UI
-      |
-      v
-Agent Loop
-      |
-      +--------------------+
-      |                    |
-      v                    v
-Finance MCP          Official MCP Servers
-(Server)             (Filesystem + SQLite)
-      |
-      v
-Financial Analysis
+    |
+    v
+app.py
+    |
+    v
+run_agent(user_goal, csv_path, statements_dir)
+    |
+    v
+Agent loop
+    |
+    +--> LLM chooses exactly one next action as JSON
+    |
+    +--> MCPManager calls the selected MCP tool
+    |
+    +--> Full tool output is stored in Python memory
+    |
+    +--> Short observation is sent back to the LLM
+    |
+    v
+final_answer returns the generated monthly report
+```
+
+The MCP manager connects three tool providers:
+
+```text
+MCPManager
+    |
+    +-- filesystem: @modelcontextprotocol/server-filesystem
+    |
+    +-- sqlite: mcp-sqlite
+    |
+    +-- finance: custom Python MCP server
+```
+
+## Main Components
+
+### `app.py`
+
+Streamlit dashboard and user entry point.
+
+Responsibilities:
+
+- lets the user choose `Single CSV` or `Directory` mode;
+- saves uploaded CSV files into `DATA_DIR`;
+- calls `run_agent(...)`;
+- renders KPI cards, category tables, merchant tables, unusual expenses, and savings insights;
+- displays the raw agent trace for debugging and demo purposes.
+
+### `agent/agent.py`
+
+The agent orchestrator.
+
+Responsibilities:
+
+- builds the system prompt and user task;
+- asks the LLM for one next action at a time;
+- parses the LLM's JSON action;
+- validates tool ordering and required previous outputs;
+- enriches or fixes tool arguments before execution;
+- stores important full outputs in internal memory;
+- sends compact observations back to the LLM to reduce token usage;
+- returns the final monthly report once the workflow is complete.
+
+### `agent/mcp_manager.py`
+
+MCP connection manager.
+
+Responsibilities:
+
+- starts MCP servers over stdio;
+- lists available tools;
+- stores tool metadata under names like `finance.analyze_statement`;
+- dispatches tool calls to the right MCP session;
+- closes all MCP sessions cleanly.
+
+### `agent/llm.py`
+
+Small LLM provider wrapper.
+
+Supported providers:
+
+- Groq
+- Ollama
+
+### `servers/finance_server.py`
+
+Custom Finance MCP server.
+
+Available finance tools include:
+
+- `categorize_transactions`
+- `analyze_statement`
+- `get_category_breakdown`
+- `get_top_merchants`
+- `find_unusual_expenses`
+- `generate_savings_advice`
+- `generate_monthly_report`
+- `prepare_monthly_report_record`
+- `merge_statements`
+
+## Data Flow
+
+### Single CSV Mode
+
+```text
+Upload CSV
+    |
+    v
+Save file into DATA_DIR
+    |
+    v
+finance.analyze_statement
+    |
+    v
+finance.find_unusual_expenses
+    |
+    v
+finance.generate_savings_advice
+    |
+    v
+finance.generate_monthly_report
+    |
+    v
+finance.prepare_monthly_report_record
+    |
+    v
+sqlite.create_record
+    |
+    v
+Streamlit dashboard output
+```
+
+### Directory Mode
+
+```text
+Select statements directory
+    |
+    v
+filesystem.list_directory
+    |
+    v
+finance.merge_statements
+    |
+    v
+Analyze merged CSV using the same single-file finance tools
+    |
+    v
+Generate report and save SQLite record
 ```
 
 ## Project Structure
 
 ```text
 finance-mcp-agent/
-
 ├── agent/
 │   ├── agent.py
 │   ├── llm.py
 │   └── mcp_manager.py
-│
 ├── client/
-│
+│   ├── list_tools.py
+│   └── test_finance_client.py
+├── data/
+│   ├── statements/
+│   ├── merged_statement.csv
+│   └── sample_statement.csv
+├── database/
+├── logs/
 ├── servers/
 │   └── finance_server.py
-│
-├── data/
-│   └── sample_statement.csv
-│
-├── database/
-│
-├── logs/
-│
 ├── app.py
 ├── requirements.txt
 └── README.md
 ```
 
-## Technologies
+## Environment Variables
 
-* Python
-* MCP (Model Context Protocol)
-* Streamlit
-* SQLite
-* Pandas
-* Groq LLM API
+Create a `.env` file in the project root.
 
-## Current Functionality
+```bash
+LLM_PROVIDER=groq
+MODEL=your-groq-model
+GROQ_API_KEY=your-api-key
 
-Implemented:
+DATA_DIR=./data
+DB_PATH=./database/finance.db
+LOG_FILE=./logs/agent.log
 
-* Custom Finance MCP server
-* MCP tool orchestration
-* Transaction categorization
-* Unusual expense detection
-* Savings advice generation
-* Monthly report generation
-* SQLite persistence
-* Category-level aggregation
+FAST_DEV_MODE=false
+FAST_DEV_SKIP_SQLITE=false
+MAX_AGENT_STEPS=14
+MAX_TOOL_OUTPUT_LENGTH=1200
+MAX_HISTORY_MESSAGES=6
+MAX_TRACE_OUTPUT_LENGTH=3000
 
-Planned:
+FINANCE_CACHE_ENABLED=true
+FINANCE_CACHE_MAX_ENTRIES=16
+```
 
-* Multi-file statement processing
-* Month-over-month analysis
-* Recurring subscription detection
-* Budget recommendations
-* Historical trend analysis
-* RAG integration
+For Ollama:
+
+```bash
+LLM_PROVIDER=ollama
+MODEL=your-ollama-model
+OLLAMA_URL=http://localhost:11434
+```
 
 ## Running the Project
 
-Install dependencies:
+Install Python dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Configure environment variables:
+The app also starts Node-based MCP servers through `npx`, so Node.js/npm must be available.
 
-```bash
-cp .env.example .env
-```
-
-Run:
+Run the Streamlit app:
 
 ```bash
 streamlit run app.py
 ```
 
-## Example Workflow
+## Developer Utilities
 
-1. Upload a bank statement CSV
-2. Agent analyzes transactions
-3. Agent identifies unusual expenses
-4. Agent generates savings advice
-5. Agent creates a monthly report
-6. Results are stored in SQLite
+List SQLite MCP tools:
 
+```bash
+python client/list_tools.py
+```
 
+Run the direct finance MCP client demo:
+
+```bash
+python client/test_finance_client.py
+```
+
+## Runtime Tuning
+
+The agent runtime is configurable through environment variables.
+
+`FAST_DEV_MODE=true` switches the defaults to a shorter development loop:
+
+- fewer maximum agent steps;
+- shorter tool output previews sent back to the LLM;
+- fewer runtime history messages kept in the prompt.
+
+`FAST_DEV_SKIP_SQLITE=true` skips SQLite persistence during development and returns the final report immediately after `finance.generate_monthly_report`.
+
+The architecture stays the same: the LLM still selects MCP tools one step at a time, and MCP tools still perform the work.
+
+Configurable runtime limits:
+
+- `MAX_AGENT_STEPS`: maximum LLM/tool iterations before the agent stops.
+- `MAX_TOOL_OUTPUT_LENGTH`: maximum characters from a tool result included in the LLM-facing observation preview.
+- `MAX_HISTORY_MESSAGES`: number of recent runtime messages kept after the initial system/user context.
+- `MAX_TRACE_OUTPUT_LENGTH`: maximum characters shown for large values in the Streamlit technical trace.
+- `FAST_DEV_SKIP_SQLITE`: skip `finance.prepare_monthly_report_record` and `sqlite.create_record` in dev runs.
+
+Timing instrumentation is recorded for each step:
+
+- LLM response time;
+- MCP tool execution time;
+- total step duration.
+
+These timings are written to `LOG_FILE` and shown in the Streamlit technical agent trace.
+
+## Performance Bottlenecks Found
+
+Main latency sources in the current runtime:
+
+- LLM calls: every agent step requires a model round trip, so unnecessary iterations are expensive.
+- MCP startup and tool calls: each run connects filesystem, SQLite, and finance MCP servers, then dispatches tool calls over stdio.
+- Repeated file processing: finance tools reload and reparse CSV files independently for analysis, unusual expense detection, categorization, and merge workflows.
+- Prompt growth: observations and action history can grow across iterations if not pruned.
+- Large tool outputs: full JSON outputs can be large, especially unusual-expense payloads or directory listings.
+- Logging and trace payloads: full observations are useful for debugging but can become noisy during fast iteration.
+
+Current mitigations:
+
+- configurable maximum agent steps;
+- configurable tool output preview length;
+- configurable prompt history limit;
+- compact LLM observations while keeping full tool outputs in Python memory;
+- per-step timing metrics to identify whether a slow run is caused by the LLM or by a tool.
+
+## Safe Caching Opportunities
+
+The Finance MCP server includes a small in-process cache for parsed and normalized CSV statements.
+
+Implemented cache:
+
+- `load_bank_csv(csv_path)` caches parsed CSV DataFrames;
+- `load_normalized_bank_csv(csv_path)` caches parsed DataFrames with normalized categories;
+- cache keys include absolute path, file size, and file modified time;
+- cached DataFrames are returned as copies so tool code cannot mutate shared cached state;
+- `FINANCE_CACHE_ENABLED=false` disables this cache;
+- `FINANCE_CACHE_MAX_ENTRIES` controls the maximum number of cached statement versions.
+
+Safe future opportunities:
+
+- cache `finance.analyze_statement(csv_path)` for unchanged files;
+- cache `finance.get_category_breakdown(csv_path)` and `finance.get_top_merchants(csv_path)` for unchanged files;
+- cache `finance.merge_statements(csv_files)` by input file paths and modified times;
+- reuse LLM provider clients across calls to avoid recreating clients every step.
+
+Caching should avoid stale financial results. Any cache key should include file path, file size, and modified time at minimum.
+
+## Current Status
+
+Implemented:
+
+- Streamlit finance dashboard
+- Single CSV analysis
+- Directory-based multi-statement analysis
+- Filesystem MCP discovery
+- Multi-file statement merge
+- Custom Finance MCP server
+- LLM tool orchestration
+- Transaction/category normalization
+- Category and merchant aggregation
+- Unusual expense detection
+- Savings advice generation
+- Monthly report generation
+- SQLite record preparation and persistence
+- Agent trace/debug view
+
+Possible next improvements:
+
+- month-over-month comparisons;
+- recurring subscription detection;
+- budget targets by category;
+- historical trend charts from SQLite;
+- report export/download controls;
+- stronger automated tests around the agent loop and finance tools.

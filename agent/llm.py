@@ -5,13 +5,38 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+_groq_client = None
+_groq_api_key = None
+_ollama_session = None
+
+
+def get_groq_client():
+    global _groq_client, _groq_api_key
+
+    api_key = os.getenv("GROQ_API_KEY")
+
+    if _groq_client is None or _groq_api_key != api_key:
+        _groq_client = Groq(api_key=api_key)
+        _groq_api_key = api_key
+
+    return _groq_client
+
+
+def get_ollama_session():
+    global _ollama_session
+
+    if _ollama_session is None:
+        _ollama_session = requests.Session()
+
+    return _ollama_session
+
 
 def call_llm(messages):
     provider = os.getenv("LLM_PROVIDER", "groq")
     model = os.getenv("MODEL")
 
     if provider == "groq":
-        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        client = get_groq_client()
 
         response = client.chat.completions.create(
             model=model,
@@ -23,8 +48,9 @@ def call_llm(messages):
 
     if provider == "ollama":
         url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+        session = get_ollama_session()
 
-        response = requests.post(
+        response = session.post(
             f"{url}/api/chat",
             json={
                 "model": model,
