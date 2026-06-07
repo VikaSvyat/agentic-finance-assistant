@@ -24,6 +24,7 @@ import logging
 import time
 import re
 from pathlib import Path
+from typing import Any, TypeAlias
 from dotenv import load_dotenv
 
 from agent.config import (
@@ -47,6 +48,12 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+Message: TypeAlias = dict[str, str]
+Memory: TypeAlias = dict[str, Any]
+Step: TypeAlias = dict[str, Any]
+ToolResults: TypeAlias = dict[str, str]
+AgentResult: TypeAlias = dict[str, Any]
+
 ### LLM must choose exactly one next action. This is needed for agentic orchestration.
 SYSTEM_PROMPT = """
 You are an agentic financial assistant.
@@ -68,7 +75,8 @@ WORKFLOW RULES:
 - After finance.merge_statements, use the existing single-file Finance MCP tools on the merged CSV.
 - Use finance.analyze_statement for the main summary.
 - Use finance.find_unusual_expenses for large expenses to review.
-- Use finance.generate_savings_advice for advice.
+- Use finance.prepare_financial_insight_context to prepare structured insight context.
+- Use finance.generate_ai_financial_insights to generate personalized observations and recommendations.
 - Before final_answer, call finance.generate_monthly_report.
 - After finance.generate_monthly_report, if SQLite tools are available, call finance.prepare_monthly_report_record.
 - Then call sqlite.create_record to save the prepared monthly report record.
@@ -82,11 +90,14 @@ IMPORTANT DATA PASSING RULE:
 - The system will automatically inject CSV files discovered from filesystem tools.
 - If you need to call finance.analyze_statement or finance.find_unusual_expenses after merging, you may pass an empty csv_path.
 - The system will automatically inject the merged CSV path returned by finance.merge_statements.
+- If you need to call finance.prepare_financial_insight_context, you may pass empty strings as args.
+- If you need to call finance.generate_ai_financial_insights, you may pass empty strings as args.
 - If you need to call finance.generate_monthly_report, you may pass empty strings as args.
 - The system will automatically inject the latest outputs from:
   - finance.analyze_statement
   - finance.find_unusual_expenses
-  - finance.generate_savings_advice
+  - finance.prepare_financial_insight_context
+  - finance.generate_ai_financial_insights
 
 Valid response format:
 
@@ -114,7 +125,7 @@ IMPORTANT FINAL ANSWER RULE:
 ### This function turns the list of MCP tools into short text for LLM. 
 # LLM doesn't know in advance what tools exist. We have to show them to her.
 # The schema is shortened correctly. Sending the full schema via tokens is expensive, so the code only takes
-def tools_to_text(tools: dict) -> str:
+def tools_to_text(tools: dict[str, Any]) -> str:
     """
     Create a compact tool description for the LLM.
     We do NOT send the full schema because it wastes tokens.
@@ -138,7 +149,25 @@ def tools_to_text(tools: dict) -> str:
     return "\n".join(lines)
 
 
-def tools_for_current_mode(tools: dict, statements_dir: str) -> dict:
+def add_virtual_agent_tools(tools: dict[str, Any]) -> dict[str, Any]:
+    tools = dict(tools)
+    tools["finance.generate_ai_financial_insights"] = {
+        "description": (
+            "Generate AI-powered financial observations and recommendations "
+            "from prepared deterministic insight context."
+        ),
+        "input_schema": {
+            "properties": {
+                "financial_context_json": {"type": "string"},
+                "analysis_json": {"type": "string"},
+                "unusual_json": {"type": "string"},
+            }
+        },
+    }
+    return tools
+
+
+def tools_for_current_mode(tools: dict[str, Any], statements_dir: str) -> dict[str, Any]:
     """
     Keep directory-only tools out of the LLM prompt in single-file mode.
     The MCP servers still exist; this only reduces confusion and prompt size.
@@ -148,6 +177,7 @@ def tools_for_current_mode(tools: dict, statements_dir: str) -> dict:
         name: meta
         for name, meta in tools.items()
         if name != "sqlite.db_info"
+        and name != "finance.generate_savings_advice"
     }
 
     if FAST_DEV_SKIP_SQLITE:
@@ -203,7 +233,7 @@ def disallowed_tool_for_mode(tool_name: str, statements_dir: str) -> str:
     return ""
 
 
-def extract_json(text: str) -> dict:
+def extract_json(text: str) -> dict[str, Any]:
     """
     Extract the first JSON object from an LLM response.
     This protects us when a small model returns extra text or several JSON objects.
@@ -240,7 +270,7 @@ def extract_json(text: str) -> dict:
     return obj
 
 
-def action_for_history(action: dict) -> dict:
+def action_for_history(action: dict[str, Any]) -> dict[str, Any]:
     """
     Keep conversation history small.
 
@@ -253,6 +283,8 @@ def action_for_history(action: dict) -> dict:
 
     memory_injected_tools = {
         "finance.generate_savings_advice",
+        "finance.prepare_financial_insight_context",
+        "finance.generate_ai_financial_insights",
         "finance.generate_monthly_report",
         "finance.prepare_monthly_report_record",
         "sqlite.create_record",
@@ -283,7 +315,7 @@ def truncate_text(value: str, limit: int = MAX_TOOL_OUTPUT_LENGTH) -> str:
     return f"{text[:limit]}\n... [truncated {omitted} chars]"
 
 
-def prune_messages(messages: list[dict]) -> list[dict]:
+def prune_messages(messages: list[Message]) -> list[Message]:
     """
     Keep the initial system/user context and only the latest runtime messages.
     This prevents prompt growth during long or error-prone agent loops.
@@ -295,12 +327,14 @@ def prune_messages(messages: list[dict]) -> list[dict]:
     return messages[:2] + messages[-MAX_HISTORY_MESSAGES:]
 
 
-def memory_state_text(memory: dict, csv_path: str) -> str:
+def memory_state_text(memory: Memory, csv_path: str) -> str:
     return f"""
 Internal state:
 - analysis_json available: {bool(memory.get("analysis_json"))}
 - unusual_json available: {bool(memory.get("unusual_json"))}
 - advice_text available: {bool(memory.get("advice_text"))}
+- financial_insight_context available: {bool(memory.get("financial_insight_context"))}
+- ai_insights_text available: {bool(memory.get("ai_insights_text"))}
 - monthly_report available: {bool(memory.get("monthly_report"))}
 - monthly_report_record available: {bool(memory.get("monthly_report_record"))}
 - discovered csv_files count: {len(memory.get("csv_files", []))}
@@ -395,7 +429,7 @@ def extract_csv_paths_from_filesystem_output(result: str, statements_dir: str = 
     return list(dict.fromkeys(csv_files))
 
 
-def remember_tool_output(tool_name: str, result: str, memory: dict) -> None:
+def remember_tool_output(tool_name: str, result: str, memory: Memory) -> None:
     """
     Store full tool outputs internally.
     These are NOT fully sent back to the LLM, but we can reuse them safely.
@@ -408,6 +442,13 @@ def remember_tool_output(tool_name: str, result: str, memory: dict) -> None:
         memory["unusual_json"] = result
 
     elif tool_name == "finance.generate_savings_advice":
+        memory["advice_text"] = result
+
+    elif tool_name == "finance.prepare_financial_insight_context":
+        memory["financial_insight_context"] = result
+
+    elif tool_name == "finance.generate_ai_financial_insights":
+        memory["ai_insights_text"] = result
         memory["advice_text"] = result
 
     elif tool_name == "finance.generate_monthly_report":
@@ -436,7 +477,7 @@ def remember_tool_output(tool_name: str, result: str, memory: dict) -> None:
             existing = memory.get("csv_files", [])
             memory["csv_files"] = list(dict.fromkeys(existing + discovered))
 
-def normalize_args(args) -> dict:
+def normalize_args(args: Any) -> dict[str, Any]:
     """
     Ensure tool args are always a dictionary.
     The LLM may accidentally return a list or a string.
@@ -458,7 +499,12 @@ def normalize_args(args) -> dict:
 ### This function fixes the arguments before calling tool.
 # LLM selects a tool, but may make a mistake in its arguments.
 
-def build_args_for_tool(tool_name: str, args: dict, csv_path: str, memory: dict) -> dict:
+def build_args_for_tool(
+    tool_name: str,
+    args: dict[str, Any],
+    csv_path: str,
+    memory: Memory,
+) -> dict[str, Any]:
     """
     Fix or enrich tool args before execution.
     """
@@ -495,12 +541,25 @@ def build_args_for_tool(tool_name: str, args: dict, csv_path: str, memory: dict)
         args = {"path": path}
 
     if tool_name == "finance.merge_statements":
-        if not args.get("csv_files"):
-            args["csv_files"] = memory.get("csv_files", [])
+        discovered_csv_files = memory.get("csv_files", [])
+
+        if discovered_csv_files:
+            args["csv_files"] = discovered_csv_files
+        elif not args.get("csv_files"):
+            args["csv_files"] = []
 
         args["output_csv_path"] = str(Path("data") / "merged_statement.csv")
 
     if tool_name == "finance.generate_savings_advice":
+        args["analysis_json"] = memory.get("analysis_json", "")
+        args["unusual_json"] = memory.get("unusual_json", "")
+
+    if tool_name == "finance.prepare_financial_insight_context":
+        args["analysis_json"] = memory.get("analysis_json", "")
+        args["unusual_json"] = memory.get("unusual_json", "")
+
+    if tool_name == "finance.generate_ai_financial_insights":
+        args["financial_context_json"] = memory.get("financial_insight_context", "")
         args["analysis_json"] = memory.get("analysis_json", "")
         args["unusual_json"] = memory.get("unusual_json", "")
 
@@ -524,7 +583,7 @@ def build_args_for_tool(tool_name: str, args: dict, csv_path: str, memory: dict)
 
 ### This function checks whether tool can already be called.
 # LLM plans. Python controls correctness
-def missing_required_memory_for_tool(tool_name: str, memory: dict) -> list:
+def missing_required_memory_for_tool(tool_name: str, memory: Memory) -> list[str]:
     """
     Check whether the selected tool already has the outputs it needs.
     The LLM still decides the next step; Python only validates dependencies.
@@ -554,13 +613,23 @@ def missing_required_memory_for_tool(tool_name: str, memory: dict) -> list:
         if not memory.get("unusual_json"):
             missing.append("finance.find_unusual_expenses")
 
+    if tool_name == "finance.prepare_financial_insight_context":
+        if not memory.get("analysis_json"):
+            missing.append("finance.analyze_statement")
+        if not memory.get("unusual_json"):
+            missing.append("finance.find_unusual_expenses")
+
+    if tool_name == "finance.generate_ai_financial_insights":
+        if not memory.get("financial_insight_context"):
+            missing.append("finance.prepare_financial_insight_context")
+
     if tool_name == "finance.generate_monthly_report":
         if not memory.get("analysis_json"):
             missing.append("finance.analyze_statement")
         if not memory.get("unusual_json"):
             missing.append("finance.find_unusual_expenses")
         if not memory.get("advice_text"):
-            missing.append("finance.generate_savings_advice")
+            missing.append("finance.generate_ai_financial_insights")
 
     if tool_name == "finance.prepare_monthly_report_record":
         if not memory.get("analysis_json"):
@@ -568,7 +637,7 @@ def missing_required_memory_for_tool(tool_name: str, memory: dict) -> list:
         if not memory.get("unusual_json"):
             missing.append("finance.find_unusual_expenses")
         if not memory.get("advice_text"):
-            missing.append("finance.generate_savings_advice")
+            missing.append("finance.generate_ai_financial_insights")
         if not memory.get("monthly_report"):
             missing.append("finance.generate_monthly_report")
 
@@ -578,11 +647,78 @@ def missing_required_memory_for_tool(tool_name: str, memory: dict) -> list:
 
     return missing
 
+
+def next_required_tool(memory: Memory) -> str:
+    """
+    Return the next missing workflow tool from internal state.
+
+    This is used only to avoid repeating already-completed prerequisite tools
+    when a small local model loses track of progress.
+    """
+
+    if memory.get("statements_dir") and not memory.get("csv_path"):
+        if not memory.get("csv_files"):
+            return "filesystem.list_directory"
+        return "finance.merge_statements"
+
+    if not memory.get("analysis_json"):
+        return "finance.analyze_statement"
+
+    if not memory.get("unusual_json"):
+        return "finance.find_unusual_expenses"
+
+    if not memory.get("financial_insight_context"):
+        return "finance.prepare_financial_insight_context"
+
+    if not memory.get("ai_insights_text"):
+        return "finance.generate_ai_financial_insights"
+
+    if not memory.get("monthly_report"):
+        return "finance.generate_monthly_report"
+
+    if FAST_DEV_SKIP_SQLITE:
+        return "final_answer"
+
+    if not memory.get("monthly_report_record"):
+        return "finance.prepare_monthly_report_record"
+
+    return "sqlite.create_record"
+
+
+def completed_tool_replacement(tool_name: str, memory: Memory) -> str:
+    completed_outputs = {
+        "finance.analyze_statement": "analysis_json",
+        "finance.find_unusual_expenses": "unusual_json",
+        "finance.generate_savings_advice": "advice_text",
+        "finance.prepare_financial_insight_context": "financial_insight_context",
+        "finance.generate_ai_financial_insights": "ai_insights_text",
+        "finance.generate_monthly_report": "monthly_report",
+        "finance.prepare_monthly_report_record": "monthly_report_record",
+        "finance.merge_statements": "csv_path",
+    }
+
+    memory_key = completed_outputs.get(tool_name)
+
+    if not memory_key or not memory.get(memory_key):
+        return ""
+
+    replacement = next_required_tool(memory)
+
+    if replacement == tool_name or replacement == "final_answer":
+        return ""
+
+    return replacement
+
 ### This function makes a short message to LLM after calling tool
 # Why a preview and not a full result? 
 # To avoid spending too many Groq tokens.
 # The full result is stored in memory.
-def make_observation(tool_name: str, result: str, ok: bool = True, error: str | None = None) -> dict:
+def make_observation(
+    tool_name: str,
+    result: str,
+    ok: bool = True,
+    error: str | None = None,
+) -> dict[str, Any]:
     """
     Create a compact observation for the LLM.
     Full results are stored separately in memory.
@@ -603,31 +739,74 @@ def make_observation(tool_name: str, result: str, ok: bool = True, error: str | 
     }
 
 
-async def run_agent(user_goal: str, csv_path: str = "", statements_dir: str = ""):
-    manager = MCPManager()
-    steps = []
-    memory = {}
+def enforce_currency_text(text: str, currency: str = "NIS") -> str:
+    cleaned = str(text)
 
-    logger.info(
-        "AGENT_START mode=%s csv_path=%s statements_dir=%s fast_dev_mode=%s max_steps=%s max_tool_output_length=%s max_history_messages=%s",
-        "directory" if statements_dir else "single_csv",
-        csv_path,
-        statements_dir,
-        FAST_DEV_MODE,
-        MAX_AGENT_STEPS,
-        MAX_TOOL_OUTPUT_LENGTH,
-        MAX_HISTORY_MESSAGES,
+    cleaned = re.sub(r"\$\s*([\d,.]+)", rf"\1 {currency}", cleaned)
+    cleaned = re.sub(
+        r"([\d,.]+)\s*(?:USD|usd|US dollars|U\.S\. dollars|dollars|Dollars)",
+        rf"\1 {currency}",
+        cleaned,
     )
+    cleaned = re.sub(r"\b(?:USD|usd|US dollars|U\.S\. dollars|dollars|Dollars)\b", currency, cleaned)
 
-    if csv_path:
-        memory["csv_path"] = csv_path
+    return cleaned
 
-    if statements_dir:
-        memory["statements_dir"] = statements_dir
 
-    try:
-        tools = await manager.connect()
-        visible_tools = tools_for_current_mode(tools, statements_dir)
+class Agent:
+    """
+    Agent runtime for one finance-analysis request.
+
+    The public orchestration stays the same; this class only owns runtime state
+    that used to live as local variables in run_agent.
+    """
+
+    def __init__(self, user_goal: str, csv_path: str = "", statements_dir: str = "") -> None:
+        self.user_goal = user_goal
+        self.csv_path = csv_path
+        self.statements_dir = statements_dir
+        self.manager = MCPManager()
+
+        self.messages: list[Message] = []
+        self.memory: Memory = {}
+        self.steps: list[Step] = []
+        self.tool_results: ToolResults = {}
+        self.tools: dict[str, Any] = {}
+
+        if csv_path:
+            self.memory["csv_path"] = csv_path
+
+        if statements_dir:
+            self.memory["statements_dir"] = statements_dir
+
+    async def run(self) -> AgentResult:
+        logger.info(
+            "AGENT_START mode=%s csv_path=%s statements_dir=%s fast_dev_mode=%s max_steps=%s max_tool_output_length=%s max_history_messages=%s",
+            "directory" if self.statements_dir else "single_csv",
+            self.csv_path,
+            self.statements_dir,
+            FAST_DEV_MODE,
+            MAX_AGENT_STEPS,
+            MAX_TOOL_OUTPUT_LENGTH,
+            MAX_HISTORY_MESSAGES,
+        )
+
+        try:
+            self.tools = add_virtual_agent_tools(await self.manager.connect())
+            self.messages = self.build_initial_messages()
+
+            for step_number in range(1, MAX_AGENT_STEPS + 1):
+                result = await self.run_step(step_number)
+                if result is not None:
+                    return result
+
+            return self.result_after_max_steps()
+
+        finally:
+            await self.manager.close()
+
+    def build_initial_messages(self) -> list[Message]:
+        visible_tools = tools_for_current_mode(self.tools, self.statements_dir)
         tools_text = tools_to_text(visible_tools)
         persistence_instruction = (
             "- FAST_DEV_SKIP_SQLITE is active: do not save to SQLite. Return final_answer after finance.generate_monthly_report."
@@ -635,14 +814,15 @@ async def run_agent(user_goal: str, csv_path: str = "", statements_dir: str = ""
             else "- Save monthly summary to SQLite by calling finance.prepare_monthly_report_record and then sqlite.create_record. Do not call sqlite.db_info."
         )
 
-        if statements_dir:
+        if self.statements_dir:
             required_workflow = f"""
 Required final result:
 - First discover CSV files using filesystem tools.
 - Then call finance.merge_statements to create one merged CSV.
 - Analyze the merged CSV using the existing finance.analyze_statement tool.
 - Find large expenses to review.
-- Generate savings advice.
+- Prepare financial insight context.
+- Generate AI financial insights from the prepared context.
 - Generate a clean monthly report.
 {persistence_instruction}
 """
@@ -653,20 +833,21 @@ Required final result:
 - Do not inspect directories.
 - Do not merge statements.
 - Find large expenses to review.
-- Generate savings advice.
+- Prepare financial insight context.
+- Generate AI financial insights from the prepared context.
 - Generate a clean monthly report.
 {persistence_instruction}
 """
 
         user_goal_full = f"""
 User goal:
-{user_goal}
+{self.user_goal}
 
 CSV path to analyze:
-{csv_path}
+{self.csv_path}
 
 Statements directory to analyze:
-{statements_dir}
+{self.statements_dir}
 
 {required_workflow}
 
@@ -674,7 +855,7 @@ Important:
 The final answer must be the report returned by finance.generate_monthly_report.
 """
 
-        messages = [
+        return [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
@@ -687,414 +868,629 @@ Available tools:
             },
         ]
 
-        for step_number in range(1, MAX_AGENT_STEPS + 1):
-            step_start = time.perf_counter()
-            llm_start = time.perf_counter()
-            llm_text = call_llm(messages)
-            llm_duration = time.perf_counter() - llm_start
+    async def run_step(self, step_number: int) -> AgentResult | None:
+        step_start = time.perf_counter()
+        llm_start = time.perf_counter()
+        llm_text = call_llm(self.messages)
+        llm_duration = time.perf_counter() - llm_start
 
-            try:
-                action = extract_json(llm_text)
-            except Exception as e:
-                total_duration = time.perf_counter() - step_start
-                error_answer = (
-                    f"LLM returned invalid JSON.\n\n"
-                    f"Error: {e}\n\n"
-                    f"Raw response:\n{truncate_text(llm_text)}"
-                )
+        try:
+            action = extract_json(llm_text)
+        except Exception as e:
+            return self.handle_invalid_json(
+                step_number,
+                step_start,
+                llm_duration,
+                llm_text,
+                e,
+            )
 
-                steps.append(
-                    {
-                        "step": step_number,
-                        "tool": "invalid_llm_response",
-                        "reason": "invalid json",
-                        "output": error_answer,
-                        "timing": {
-                            "llm_response_seconds": round(llm_duration, 3),
-                            "tool_execution_seconds": 0.0,
-                            "total_step_seconds": round(total_duration, 3),
-                        },
-                    }
-                )
+        tool_name = action.get("tool")
+        raw_args = action.get("args", {})
+        reason = action.get("reason", "")
 
-                logger.error(
-                    "INVALID_LLM_JSON step=%s error=%s raw=%s",
-                    step_number,
-                    str(e),
-                    truncate_text(llm_text),
-                )
+        if tool_name == "final_answer":
+            return self.finish_with_final_answer(
+                step_number,
+                step_start,
+                llm_duration,
+                raw_args,
+                reason,
+            )
 
+        if tool_name not in self.tools:
+            observation = {
+                "tool": tool_name,
+                "ok": False,
+                "error": f"Unknown tool: {tool_name}",
+            }
+            self.record_non_executed_tool(
+                step_number,
+                step_start,
+                llm_duration,
+                action,
+                raw_args,
+                reason,
+                observation,
+                "Choose another available tool.",
+            )
+            return None
+
+        mode_error = disallowed_tool_for_mode(tool_name, self.statements_dir)
+
+        if mode_error:
+            observation = {
+                "tool": tool_name,
+                "ok": False,
+                "error": mode_error,
+            }
+            self.record_non_executed_tool(
+                step_number,
+                step_start,
+                llm_duration,
+                action,
+                raw_args,
+                reason,
+                observation,
+                "Continue in Single CSV mode. Choose finance.analyze_statement for the provided csv_path.",
+            )
+            return None
+
+        replacement_tool = completed_tool_replacement(tool_name, self.memory)
+
+        if replacement_tool:
+            logger.info(
+                "REPLACE repeated_tool=%s next_required_tool=%s",
+                tool_name,
+                replacement_tool,
+            )
+            tool_name = replacement_tool
+            raw_args = {}
+            action = {
+                "tool": tool_name,
+                "args": raw_args,
+                "reason": f"runtime advanced from repeated completed tool to {tool_name}",
+            }
+            reason = action["reason"]
+
+        missing = missing_required_memory_for_tool(tool_name, self.memory)
+
+        if missing:
+            replacement_tool = next_required_tool(self.memory)
+
+            if replacement_tool and replacement_tool != tool_name and replacement_tool in self.tools:
                 logger.info(
-                    "TIMING step=%s tool=invalid_llm_response llm=%.3fs tool=0.000s total=%.3fs",
-                    step_number,
-                    llm_duration,
-                    total_duration,
-                )
-
-                if step_number >= MAX_AGENT_STEPS:
-                    return {"answer": error_answer, "steps": steps}
-
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": f"""
-Your previous response was invalid JSON.
-
-Error:
-{str(e)}
-
-Return exactly ONE JSON object in this format:
-{{"tool": "server.tool_name", "args": {{}}, "reason": "short reason"}}
-
-{memory_state_text(memory, csv_path)}
-
-Continue. Choose exactly ONE next tool or final_answer.
-""",
-                    }
-                )
-                messages = prune_messages(messages)
-
-                continue
-
-            tool_name = action.get("tool")
-            raw_args = action.get("args", {})
-            reason = action.get("reason", "")
-
-            if tool_name == "final_answer":
-                total_duration = time.perf_counter() - step_start
-                if memory.get("monthly_report"):
-                    answer = memory["monthly_report"]
-                else:
-                    answer = raw_args.get(
-                        "answer",
-                        "The agent finished, but no monthly report was generated.",
-                    )
-
-                steps.append(
-                    {
-                        "step": step_number,
-                        "tool": "final_answer",
-                        "reason": reason,
-                        "output": answer,
-                        "timing": {
-                            "llm_response_seconds": round(llm_duration, 3),
-                            "tool_execution_seconds": 0.0,
-                            "total_step_seconds": round(total_duration, 3),
-                        },
-                    }
-                )
-
-                logger.info(
-                    "TIMING step=%s tool=final_answer llm=%.3fs tool=0.000s total=%.3fs",
-                    step_number,
-                    llm_duration,
-                    total_duration,
-                )
-
-                return {"answer": answer, "steps": steps}
-
-            if tool_name not in tools:
-                total_duration = time.perf_counter() - step_start
-                observation = {
-                    "tool": tool_name,
-                    "ok": False,
-                    "error": f"Unknown tool: {tool_name}",
-                }
-
-                steps.append(
-                    {
-                        "step": step_number,
-                        "tool": tool_name,
-                        "args": raw_args,
-                        "reason": reason,
-                        "observation": observation,
-                        "timing": {
-                            "llm_response_seconds": round(llm_duration, 3),
-                            "tool_execution_seconds": 0.0,
-                            "total_step_seconds": round(total_duration, 3),
-                        },
-                    }
-                )
-
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": json.dumps(action_for_history(action), ensure_ascii=False),
-                    }
-                )
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": f"""
-Tool observation:
-{json.dumps(observation, ensure_ascii=False)}
-
-Choose another available tool.
-""",
-                    }
-                )
-                messages = prune_messages(messages)
-
-                logger.info(
-                    "TIMING step=%s tool=%s llm=%.3fs tool=0.000s total=%.3fs",
-                    step_number,
+                    "REPLACE missing_dependency_tool=%s next_required_tool=%s missing=%s",
                     tool_name,
-                    llm_duration,
-                    total_duration,
+                    replacement_tool,
+                    missing,
                 )
-
-                continue
-
-            mode_error = disallowed_tool_for_mode(tool_name, statements_dir)
-
-            if mode_error:
-                total_duration = time.perf_counter() - step_start
-                observation = {
+                tool_name = replacement_tool
+                raw_args = {}
+                action = {
                     "tool": tool_name,
-                    "ok": False,
-                    "error": mode_error,
+                    "args": raw_args,
+                    "reason": f"runtime selected missing prerequisite tool {tool_name}",
                 }
-
-                steps.append(
-                    {
-                        "step": step_number,
-                        "tool": tool_name,
-                        "args": raw_args,
-                        "reason": reason,
-                        "observation": observation,
-                        "timing": {
-                            "llm_response_seconds": round(llm_duration, 3),
-                            "tool_execution_seconds": 0.0,
-                            "total_step_seconds": round(total_duration, 3),
-                        },
-                    }
-                )
-
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": json.dumps(action_for_history(action), ensure_ascii=False),
-                    }
-                )
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": f"""
-Tool observation:
-{json.dumps(observation, ensure_ascii=False)}
-
-Continue in Single CSV mode. Choose finance.analyze_statement for the provided csv_path.
-""",
-                    }
-                )
-                messages = prune_messages(messages)
-
-                logger.info(
-                    "TIMING step=%s tool=%s llm=%.3fs tool=0.000s total=%.3fs",
-                    step_number,
-                    tool_name,
-                    llm_duration,
-                    total_duration,
-                )
-
-                continue
-
-            missing = missing_required_memory_for_tool(tool_name, memory)
+                reason = action["reason"]
+                missing = missing_required_memory_for_tool(tool_name, self.memory)
 
             if missing:
-                total_duration = time.perf_counter() - step_start
                 observation = {
                     "tool": tool_name,
                     "ok": False,
                     "error": f"Missing required previous outputs. First call: {missing}",
                 }
-
-                steps.append(
-                    {
-                        "step": step_number,
-                        "tool": tool_name,
-                        "args": raw_args,
-                        "reason": reason,
-                        "observation": observation,
-                        "timing": {
-                            "llm_response_seconds": round(llm_duration, 3),
-                            "tool_execution_seconds": 0.0,
-                            "total_step_seconds": round(total_duration, 3),
-                        },
-                    }
-                )
-
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": json.dumps(action_for_history(action), ensure_ascii=False),
-                    }
-                )
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": f"""
-Tool observation:
-{json.dumps(observation, ensure_ascii=False)}
-
-Continue. Choose ONE missing tool first.
-""",
-                    }
-                )
-                messages = prune_messages(messages)
-
-                logger.info(
-                    "TIMING step=%s tool=%s llm=%.3fs tool=0.000s total=%.3fs",
+                self.record_non_executed_tool(
                     step_number,
-                    tool_name,
+                    step_start,
                     llm_duration,
-                    total_duration,
+                    action,
+                    raw_args,
+                    reason,
+                    observation,
+                    "Continue. Choose ONE missing tool first.",
                 )
+                return None
 
-                continue
-
-            args = build_args_for_tool(tool_name, raw_args, csv_path, memory)
-
-            step_record = {
-                "step": step_number,
-                "tool": tool_name,
-                "args": args,
-                "reason": reason,
-            }
-
-            logger.info(
-                "CALL tool=%s args=%s reason=%s",
-                tool_name,
-                short_json(args),
+        if tool_name == "finance.generate_ai_financial_insights":
+            return self.execute_ai_insights_step(
+                step_number,
+                step_start,
+                llm_duration,
+                action,
+                raw_args,
                 reason,
             )
 
-            result = None
-            last_error = None
-            tool_start = time.perf_counter()
+        return await self.execute_tool_step(
+            step_number,
+            step_start,
+            llm_duration,
+            action,
+            tool_name,
+            raw_args,
+            reason,
+        )
 
-            for attempt in range(1, 4):
-                try:
-                    result = await manager.call_tool(tool_name, args)
-                    if isinstance(result, str) and result.startswith("Error executing tool"):
-                        raise RuntimeError(result)
-                    last_error = None
-                    break
-                except Exception as e:
-                    last_error = str(e)
-                    logger.error(
-                        "ERROR tool=%s attempt=%s error=%s",
-                        tool_name,
-                        attempt,
-                        last_error,
-                    )
+    def handle_invalid_json(
+        self,
+        step_number: int,
+        step_start: float,
+        llm_duration: float,
+        llm_text: str,
+        error: Exception,
+    ) -> AgentResult | None:
+        total_duration = time.perf_counter() - step_start
+        error_answer = (
+            f"LLM returned invalid JSON.\n\n"
+            f"Error: {error}\n\n"
+            f"Raw response:\n{truncate_text(llm_text)}"
+        )
 
-            tool_duration = time.perf_counter() - tool_start
-
-            if last_error:
-                observation = make_observation(
-                    tool_name=tool_name,
-                    result="",
-                    ok=False,
-                    error=last_error,
-                )
-            else:
-                remember_tool_output(tool_name, str(result), memory)
-                observation = make_observation(
-                    tool_name=tool_name,
-                    result=str(result),
-                    ok=True,
-                )
-
-            llm_observation = {
-                "tool": observation.get("tool"),
-                "ok": observation.get("ok"),
-                "output_preview": observation.get("output_preview", ""),
-                "error": observation.get("error", ""),
+        self.steps.append(
+            {
+                "step": step_number,
+                "tool": "invalid_llm_response",
+                "reason": "invalid json",
+                "output": error_answer,
+                "timing": {
+                    "llm_response_seconds": round(llm_duration, 3),
+                    "tool_execution_seconds": 0.0,
+                    "total_step_seconds": round(total_duration, 3),
+                },
             }
+        )
 
-            total_duration = time.perf_counter() - step_start
+        logger.error(
+            "INVALID_LLM_JSON step=%s error=%s raw=%s",
+            step_number,
+            str(error),
+            truncate_text(llm_text),
+        )
 
-            logger.info(
-                "RESULT tool=%s output=%s",
-                tool_name,
-                short_json(observation),
-            )
+        logger.info(
+            "TIMING step=%s tool=invalid_llm_response llm=%.3fs tool=0.000s total=%.3fs",
+            step_number,
+            llm_duration,
+            total_duration,
+        )
 
-            logger.info(
-                "TIMING step=%s tool=%s llm=%.3fs tool=%.3fs total=%.3fs",
-                step_number,
-                tool_name,
-                llm_duration,
-                tool_duration,
-                total_duration,
-            )
+        if step_number >= MAX_AGENT_STEPS:
+            return {"answer": error_answer, "steps": self.steps}
 
-            step_record["timing"] = {
-                "llm_response_seconds": round(llm_duration, 3),
-                "tool_execution_seconds": round(tool_duration, 3),
-                "total_step_seconds": round(total_duration, 3),
-            }
-            step_record["observation"] = observation
-            steps.append(step_record)
+        self.messages.append(
+            {
+                "role": "user",
+                "content": f"""
+Your previous response was invalid JSON.
 
-            if (
-                FAST_DEV_SKIP_SQLITE
-                and tool_name == "finance.generate_monthly_report"
-                and memory.get("monthly_report")
-            ):
-                steps.append(
-                    {
-                        "step": step_number + 1,
-                        "tool": "final_answer",
-                        "reason": "FAST_DEV_SKIP_SQLITE completed after report generation",
-                        "output": memory["monthly_report"],
-                        "timing": {
-                            "llm_response_seconds": 0.0,
-                            "tool_execution_seconds": 0.0,
-                            "total_step_seconds": 0.0,
-                        },
-                    }
-                )
+Error:
+{str(error)}
 
-                logger.info(
-                    "FAST_DEV_SKIP_SQLITE returning final_answer after finance.generate_monthly_report"
-                )
+Return exactly ONE JSON object in this format:
+{{"tool": "server.tool_name", "args": {{}}, "reason": "short reason"}}
 
-                return {"answer": memory["monthly_report"], "steps": steps}
-
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": json.dumps(action_for_history(action), ensure_ascii=False),
-                }
-            )
-
-            messages.append(
-                {
-                    "role": "user",
-                    "content": f"""
-Tool observation:
-{json.dumps(llm_observation, ensure_ascii=False)}
-
-{memory_state_text(memory, csv_path)}
+{memory_state_text(self.memory, self.csv_path)}
 
 Continue. Choose exactly ONE next tool or final_answer.
 """,
+            }
+        )
+        self.prune_messages()
+
+        return None
+
+    def finish_with_final_answer(
+        self,
+        step_number: int,
+        step_start: float,
+        llm_duration: float,
+        raw_args: Any,
+        reason: str,
+    ) -> AgentResult:
+        total_duration = time.perf_counter() - step_start
+        normalized_args = normalize_args(raw_args)
+        if self.memory.get("monthly_report"):
+            answer = self.memory["monthly_report"]
+        else:
+            answer = normalized_args.get(
+                "answer",
+                "The agent finished, but no monthly report was generated.",
+            )
+
+        self.steps.append(
+            {
+                "step": step_number,
+                "tool": "final_answer",
+                "reason": reason,
+                "output": answer,
+                "timing": {
+                    "llm_response_seconds": round(llm_duration, 3),
+                    "tool_execution_seconds": 0.0,
+                    "total_step_seconds": round(total_duration, 3),
+                },
+            }
+        )
+
+        logger.info(
+            "TIMING step=%s tool=final_answer llm=%.3fs tool=0.000s total=%.3fs",
+            step_number,
+            llm_duration,
+            total_duration,
+        )
+
+        return {"answer": answer, "steps": self.steps}
+
+    def record_non_executed_tool(
+        self,
+        step_number: int,
+        step_start: float,
+        llm_duration: float,
+        action: dict[str, Any],
+        raw_args: Any,
+        reason: str,
+        observation: dict[str, Any],
+        next_instruction: str,
+    ) -> None:
+        total_duration = time.perf_counter() - step_start
+        tool_name = str(observation.get("tool", ""))
+
+        self.steps.append(
+            {
+                "step": step_number,
+                "tool": tool_name,
+                "args": raw_args,
+                "reason": reason,
+                "observation": observation,
+                "timing": {
+                    "llm_response_seconds": round(llm_duration, 3),
+                    "tool_execution_seconds": 0.0,
+                    "total_step_seconds": round(total_duration, 3),
+                },
+            }
+        )
+
+        self.messages.append(
+            {
+                "role": "assistant",
+                "content": json.dumps(action_for_history(action), ensure_ascii=False),
+            }
+        )
+        self.messages.append(
+            {
+                "role": "user",
+                "content": f"""
+Tool observation:
+{json.dumps(observation, ensure_ascii=False)}
+
+{next_instruction}
+""",
+            }
+        )
+        self.prune_messages()
+
+        logger.info(
+            "TIMING step=%s tool=%s llm=%.3fs tool=0.000s total=%.3fs",
+            step_number,
+            tool_name,
+            llm_duration,
+            total_duration,
+        )
+
+    def execute_ai_insights_step(
+        self,
+        step_number: int,
+        step_start: float,
+        llm_duration: float,
+        action: dict[str, Any],
+        raw_args: Any,
+        reason: str,
+    ) -> AgentResult | None:
+        args = build_args_for_tool(
+            "finance.generate_ai_financial_insights",
+            raw_args,
+            self.csv_path,
+            self.memory,
+        )
+        currency = "NIS"
+        try:
+            financial_context = json.loads(args.get("financial_context_json", "{}"))
+            currency = financial_context.get("currency") or currency
+        except Exception:
+            pass
+
+        insight_start = time.perf_counter()
+        insight_text = call_llm(
+            [
+                {
+                    "role": "system",
+                    "content": """
+You are a financial insight writer.
+Use only the provided deterministic financial context.
+Do not calculate new totals.
+Do not invent merchants, categories, amounts, or percentages.
+The only valid currency is the currency field from the context.
+For this run, write every monetary amount in NIS/shekel terms only.
+Never use $, USD, dollars, or any other foreign currency label.
+Avoid generic advice such as "reduce spending by 10-15%".
+Write 3-5 concise personalized observations and practical recommendations.
+Ground every recommendation in the provided data.
+""",
+                },
+                {
+                    "role": "user",
+                    "content": f"""
+Prepared financial context JSON:
+{args.get("financial_context_json", "")}
+
+Spending summary JSON:
+{args.get("analysis_json", "")}
+
+Unusual expenses JSON:
+{args.get("unusual_json", "")}
+
+Return a concise markdown section with:
+- 3-5 personalized observations
+- practical recommendations
+- explanation of spending patterns
+- potential areas for review
+""",
+                },
+            ]
+        )
+        insight_text = enforce_currency_text(insight_text, currency)
+        insight_duration = time.perf_counter() - insight_start
+        total_duration = time.perf_counter() - step_start
+
+        remember_tool_output(
+            "finance.generate_ai_financial_insights",
+            insight_text,
+            self.memory,
+        )
+        self.tool_results["finance.generate_ai_financial_insights"] = insight_text
+
+        observation = make_observation(
+            tool_name="finance.generate_ai_financial_insights",
+            result=insight_text,
+            ok=True,
+        )
+
+        step_record: Step = {
+            "step": step_number,
+            "tool": "finance.generate_ai_financial_insights",
+            "args": args,
+            "reason": reason,
+            "observation": observation,
+            "timing": {
+                "llm_response_seconds": round(llm_duration, 3),
+                "tool_execution_seconds": round(insight_duration, 3),
+                "total_step_seconds": round(total_duration, 3),
+            },
+        }
+        self.steps.append(step_record)
+
+        logger.info(
+            "RESULT tool=%s output=%s",
+            "finance.generate_ai_financial_insights",
+            short_json(observation),
+        )
+        logger.info(
+            "TIMING step=%s tool=%s llm=%.3fs tool=%.3fs total=%.3fs",
+            step_number,
+            "finance.generate_ai_financial_insights",
+            llm_duration,
+            insight_duration,
+            total_duration,
+        )
+
+        llm_observation = {
+            "tool": observation.get("tool"),
+            "ok": observation.get("ok"),
+            "output_preview": observation.get("output_preview", ""),
+            "error": observation.get("error", ""),
+        }
+
+        self.messages.append(
+            {
+                "role": "assistant",
+                "content": json.dumps(action_for_history(action), ensure_ascii=False),
+            }
+        )
+        self.messages.append(
+            {
+                "role": "user",
+                "content": f"""
+Tool observation:
+{json.dumps(llm_observation, ensure_ascii=False)}
+
+{memory_state_text(self.memory, self.csv_path)}
+
+Continue. Choose exactly ONE next tool or final_answer.
+""",
+            }
+        )
+        self.prune_messages()
+
+        return None
+
+    async def execute_tool_step(
+        self,
+        step_number: int,
+        step_start: float,
+        llm_duration: float,
+        action: dict[str, Any],
+        tool_name: str,
+        raw_args: Any,
+        reason: str,
+    ) -> AgentResult | None:
+        args = build_args_for_tool(tool_name, raw_args, self.csv_path, self.memory)
+
+        step_record: Step = {
+            "step": step_number,
+            "tool": tool_name,
+            "args": args,
+            "reason": reason,
+        }
+
+        logger.info(
+            "CALL tool=%s args=%s reason=%s",
+            tool_name,
+            short_json(args),
+            reason,
+        )
+
+        result, last_error, tool_duration = await self.call_tool_with_retries(
+            tool_name,
+            args,
+        )
+
+        if last_error:
+            observation = make_observation(
+                tool_name=tool_name,
+                result="",
+                ok=False,
+                error=last_error,
+            )
+        else:
+            result_text = str(result)
+            self.tool_results[tool_name] = result_text
+            remember_tool_output(tool_name, result_text, self.memory)
+            observation = make_observation(
+                tool_name=tool_name,
+                result=result_text,
+                ok=True,
+            )
+
+        llm_observation = {
+            "tool": observation.get("tool"),
+            "ok": observation.get("ok"),
+            "output_preview": observation.get("output_preview", ""),
+            "error": observation.get("error", ""),
+        }
+
+        total_duration = time.perf_counter() - step_start
+
+        logger.info(
+            "RESULT tool=%s output=%s",
+            tool_name,
+            short_json(observation),
+        )
+
+        logger.info(
+            "TIMING step=%s tool=%s llm=%.3fs tool=%.3fs total=%.3fs",
+            step_number,
+            tool_name,
+            llm_duration,
+            tool_duration,
+            total_duration,
+        )
+
+        step_record["timing"] = {
+            "llm_response_seconds": round(llm_duration, 3),
+            "tool_execution_seconds": round(tool_duration, 3),
+            "total_step_seconds": round(total_duration, 3),
+        }
+        step_record["observation"] = observation
+        self.steps.append(step_record)
+
+        if (
+            FAST_DEV_SKIP_SQLITE
+            and tool_name == "finance.generate_monthly_report"
+            and self.memory.get("monthly_report")
+        ):
+            self.steps.append(
+                {
+                    "step": step_number + 1,
+                    "tool": "final_answer",
+                    "reason": "FAST_DEV_SKIP_SQLITE completed after report generation",
+                    "output": self.memory["monthly_report"],
+                    "timing": {
+                        "llm_response_seconds": 0.0,
+                        "tool_execution_seconds": 0.0,
+                        "total_step_seconds": 0.0,
+                    },
                 }
             )
-            messages = prune_messages(messages)
 
-        if memory.get("monthly_report"):
+            logger.info(
+                "FAST_DEV_SKIP_SQLITE returning final_answer after finance.generate_monthly_report"
+            )
+
+            return {"answer": self.memory["monthly_report"], "steps": self.steps}
+
+        self.messages.append(
+            {
+                "role": "assistant",
+                "content": json.dumps(action_for_history(action), ensure_ascii=False),
+            }
+        )
+
+        self.messages.append(
+            {
+                "role": "user",
+                "content": f"""
+Tool observation:
+{json.dumps(llm_observation, ensure_ascii=False)}
+
+{memory_state_text(self.memory, self.csv_path)}
+
+Continue. Choose exactly ONE next tool or final_answer.
+""",
+            }
+        )
+        self.prune_messages()
+
+        return None
+
+    async def call_tool_with_retries(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> tuple[Any, str | None, float]:
+        result: Any = None
+        last_error: str | None = None
+        tool_start = time.perf_counter()
+
+        for attempt in range(1, 4):
+            try:
+                result = await self.manager.call_tool(tool_name, args)
+                if isinstance(result, str) and result.startswith("Error executing tool"):
+                    raise RuntimeError(result)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = str(e)
+                logger.error(
+                    "ERROR tool=%s attempt=%s error=%s",
+                    tool_name,
+                    attempt,
+                    last_error,
+                )
+
+        tool_duration = time.perf_counter() - tool_start
+
+        return result, last_error, tool_duration
+
+    def prune_messages(self) -> None:
+        self.messages = prune_messages(self.messages)
+
+    def result_after_max_steps(self) -> AgentResult:
+        if self.memory.get("monthly_report"):
             return {
-                "answer": memory["monthly_report"],
-                "steps": steps,
+                "answer": self.memory["monthly_report"],
+                "steps": self.steps,
             }
 
         return {
             "answer": "Agent stopped after max steps. Check logs/agent.log.",
-            "steps": steps,
+            "steps": self.steps,
         }
 
-    finally:
-        await manager.close() #Closing MCP connections
+
+async def run_agent(
+    user_goal: str,
+    csv_path: str = "",
+    statements_dir: str = "",
+) -> AgentResult:
+    return await Agent(user_goal, csv_path, statements_dir).run()

@@ -16,6 +16,8 @@ load_dotenv()
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DATA_DIR.mkdir(exist_ok=True)
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR_RESOLVED = DATA_DIR.resolve()
 
 st.set_page_config(page_title="Finance MCP Agent", page_icon="💸", layout="wide")
 
@@ -97,6 +99,25 @@ def extract_json_from_step(steps, tool_name):
                 st.code(str(raw)[:2000])
                 return None
     return None
+
+
+def extract_text_from_step(steps, tool_name):
+    for step in steps:
+        if step.get("tool") != tool_name:
+            continue
+
+        if step.get("output"):
+            return str(step["output"])
+
+        obs = step.get("observation", {})
+        if not isinstance(obs, dict):
+            continue
+
+        raw = obs.get("full_output") or obs.get("output") or obs.get("result") or obs.get("output_preview") or ""
+        if raw:
+            return str(raw)
+
+    return ""
 
 
 def parse_report_fallback(report: str):
@@ -213,23 +234,88 @@ def prepare_expenses_df(unusual):
     return df[[c for c in cols if c in df.columns]]
 
 
+def is_path_inside(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def safe_uploaded_csv_path(uploaded_name: str) -> tuple[Path | None, str]:
+    filename = Path(uploaded_name).name
+
+    if not filename or filename in {".", ".."}:
+        return None, "Uploaded file name is not valid."
+
+    if Path(filename).suffix.lower() != ".csv":
+        return None, "Only CSV files are supported."
+
+    csv_path = (DATA_DIR / filename).resolve()
+
+    if not is_path_inside(csv_path, DATA_DIR_RESOLVED):
+        return None, "Uploaded file path is outside the data directory."
+
+    return csv_path, ""
+
+
+def validate_statements_directory(raw_path: str) -> tuple[Path | None, str]:
+    path_text = raw_path.strip()
+
+    if not path_text:
+        return None, "Enter a statements directory first."
+
+    if path_text.startswith("file://"):
+        return None, "Use a local path without file:// prefix."
+
+    directory = Path(path_text).expanduser().resolve()
+
+    if not directory.exists():
+        return None, "Directory does not exist."
+
+    if not directory.is_dir():
+        return None, "Path is not a directory."
+
+    if not is_path_inside(directory, PROJECT_ROOT):
+        return None, f"Directory must be inside the project folder: {PROJECT_ROOT}"
+
+    csv_files = list(directory.glob("*.csv"))
+
+    if not csv_files:
+        return None, "Directory does not contain CSV files."
+
+    return directory, ""
+
+
 def run_selected_agent():
     if input_mode == "Single CSV":
         if not uploaded_file:
             st.warning("Upload a CSV file first.")
             return None
-        csv_path = DATA_DIR / uploaded_file.name
+
+        csv_path, error = safe_uploaded_csv_path(uploaded_file.name)
+        if error:
+            st.error(error)
+            return None
+
         with open(csv_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
+
+        if not csv_path.exists():
+            st.error("Uploaded file was not saved correctly.")
+            return None
+
         st.success(f"File saved to: `{csv_path}`")
         return asyncio.run(run_agent(goal, str(csv_path)))
 
-    if not statements_dir.strip():
-        st.warning("Enter a statements directory first.")
+    directory, error = validate_statements_directory(statements_dir)
+
+    if error:
+        st.warning(error)
         return None
 
-    st.info(f"Directory selected: `{statements_dir}`")
-    return asyncio.run(run_agent(goal, csv_path="", statements_dir=statements_dir.strip()))
+    st.info(f"Directory selected: `{directory}`")
+    return asyncio.run(run_agent(goal, csv_path="", statements_dir=str(directory)))
 
 
 can_run = uploaded_file is not None if input_mode == "Single CSV" else bool(statements_dir.strip())
@@ -244,12 +330,13 @@ if st.button("🚀 Run Agent", disabled=not can_run):
 
         analysis = extract_json_from_step(steps, "finance.analyze_statement")
         unusual = extract_json_from_step(steps, "finance.find_unusual_expenses")
+        ai_insights = extract_text_from_step(steps, "finance.generate_ai_financial_insights")
 
         if not analysis:
             analysis = parse_report_fallback(answer)
 
         st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-        st.header("📊 Monthly Finance Report")
+        st.header("Financial Summary")
 
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -287,27 +374,12 @@ if st.button("🚀 Run Agent", disabled=not can_run):
             st.success("No large expenses detected.")
 
         st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-        st.subheader("💡 Savings Insights")
+        st.header("AI Insights")
 
-        top_categories = analysis.get("top_categories", [])
-        if top_categories:
-            top = top_categories[0]
-            total = analysis.get("total_spent", 0)
-            amount = top.get("total_amount", 0)
-            category = top.get("category_en", "Unknown")
-            percent = (amount / total * 100) if total else 0
-            low_saving = amount * 0.10
-            high_saving = amount * 0.15
-
-            st.markdown(f"""
-            <div class="business-card">
-                <b>Main spending driver:</b> {category} accounts for <b>{percent:.1f}%</b> of total spending.<br>
-                <b>Recommendation:</b> Try reducing spending in this category by <b>10–15%</b> next month.<br>
-                <b>Potential impact:</b> Estimated monthly savings of <b>{low_saving:,.0f}–{high_saving:,.0f} NIS</b>.
-            </div>
-            """, unsafe_allow_html=True)
+        if ai_insights:
+            st.markdown(ai_insights)
         else:
-            st.info("Savings insight could not be generated from structured data.")
+            st.info("AI insights were not generated for this run.")
 
         st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
 

@@ -446,6 +446,189 @@ def generate_monthly_report(analysis_json: str, unusual_json: str, advice_text: 
 
 
 @mcp.tool()
+def prepare_financial_insight_context(analysis_json: str, unusual_json: str) -> str:
+    """
+    Prepare structured financial context for LLM interpretation.
+
+    This tool does not generate natural language advice. It only transforms
+    deterministic analysis outputs into a compact JSON context.
+    """
+
+    if not analysis_json or not analysis_json.strip():
+        return json.dumps(
+            {"error": "analysis_json is empty. Call finance.analyze_statement first."},
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    if not unusual_json or not unusual_json.strip():
+        return json.dumps(
+            {"error": "unusual_json is empty. Call finance.find_unusual_expenses first."},
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    analysis = json.loads(analysis_json)
+    unusual = json.loads(unusual_json)
+
+    total_spent = float(analysis.get("total_spent", 0) or 0)
+    top_categories = analysis.get("top_categories", []) or []
+    top_merchants = analysis.get("top_merchants", []) or []
+    large_expenses = unusual.get("large_expenses_to_review", []) or []
+
+    largest_spending_categories = []
+    for item in top_categories[:5]:
+        amount = float(item.get("total_amount", 0) or 0)
+        largest_spending_categories.append(
+            {
+                "category": item.get("category"),
+                "category_en": item.get("category_en"),
+                "total_amount": round(amount, 2),
+                "share_of_total_percent": round((amount / total_spent * 100), 2) if total_spent else 0,
+                "transactions_count": item.get("transactions_count", 0),
+                "average_transaction": item.get("average_transaction", 0),
+            }
+        )
+
+    recurring_merchants = []
+    for item in top_merchants:
+        count = int(item.get("transactions_count", 0) or 0)
+        if count < 2:
+            continue
+
+        amount = float(item.get("total_amount", 0) or 0)
+        recurring_merchants.append(
+            {
+                "merchant": item.get("merchant"),
+                "total_amount": round(amount, 2),
+                "share_of_total_percent": round((amount / total_spent * 100), 2) if total_spent else 0,
+                "transactions_count": count,
+                "average_transaction": item.get("average_transaction", 0),
+            }
+        )
+
+    top_category_amount = sum(
+        float(item.get("total_amount", 0) or 0)
+        for item in top_categories[:1]
+    )
+    top_3_category_amount = sum(
+        float(item.get("total_amount", 0) or 0)
+        for item in top_categories[:3]
+    )
+
+    category_concentration = {
+        "top_category_share_percent": round((top_category_amount / total_spent * 100), 2) if total_spent else 0,
+        "top_3_categories_share_percent": round((top_3_category_amount / total_spent * 100), 2) if total_spent else 0,
+        "top_category": top_categories[0].get("category_en") if top_categories else None,
+    }
+
+    spending_patterns = []
+
+    if largest_spending_categories:
+        spending_patterns.append(
+            {
+                "type": "largest_category",
+                "description": "Largest category by total amount",
+                "data": largest_spending_categories[0],
+            }
+        )
+
+    if category_concentration["top_3_categories_share_percent"] >= 60:
+        spending_patterns.append(
+            {
+                "type": "category_concentration",
+                "description": "Most spending is concentrated in the top 3 categories",
+                "data": category_concentration,
+            }
+        )
+
+    if recurring_merchants:
+        spending_patterns.append(
+            {
+                "type": "recurring_merchants",
+                "description": "Merchants with repeated transactions",
+                "data": recurring_merchants[:5],
+            }
+        )
+
+    if large_expenses:
+        spending_patterns.append(
+            {
+                "type": "unusual_expenses",
+                "description": "Transactions above merchant/category thresholds",
+                "data": large_expenses[:5],
+            }
+        )
+
+    controllable_categories = {
+        "food_and_groceries",
+        "restaurants_cafes_bars",
+        "home_and_furniture",
+        "other",
+        "fuel",
+    }
+
+    possible_saving_opportunities = [
+        {
+            "type": "category_review",
+            "category": item.get("category"),
+            "category_en": item.get("category_en"),
+            "total_amount": item.get("total_amount"),
+            "share_of_total_percent": item.get("share_of_total_percent"),
+            "reason": "High-spend category that may include discretionary transactions",
+        }
+        for item in largest_spending_categories
+        if item.get("category") in controllable_categories
+    ]
+
+    possible_saving_opportunities.extend(
+        {
+            "type": "merchant_review",
+            "merchant": item.get("merchant"),
+            "total_amount": item.get("total_amount"),
+            "transactions_count": item.get("transactions_count"),
+            "reason": "Recurring merchant with meaningful monthly spend",
+        }
+        for item in recurring_merchants[:5]
+    )
+
+    possible_saving_opportunities.extend(
+        {
+            "type": "unusual_expense_review",
+            "merchant": item.get("merchant"),
+            "transaction_date": item.get("transaction_date"),
+            "amount": item.get("amount"),
+            "category_en": item.get("normalized_category_en"),
+            "reason": "Transaction exceeded the deterministic unusual-expense threshold",
+        }
+        for item in large_expenses[:5]
+    )
+
+    result = {
+        "currency": analysis.get("currency", "NIS"),
+        "spending_summary": {
+            "total_spent": analysis.get("total_spent", 0),
+            "transactions_count": analysis.get("transactions_count", 0),
+            "average_transaction": analysis.get("average_transaction", 0),
+        },
+        "largest_spending_categories": largest_spending_categories,
+        "recurring_merchants": recurring_merchants[:10],
+        "unusual_expenses": large_expenses[:10],
+        "category_concentration": category_concentration,
+        "spending_patterns": spending_patterns,
+        "possible_saving_opportunities": possible_saving_opportunities[:12],
+        "llm_guidance": [
+            "Use these deterministic facts to explain spending behavior.",
+            "Do not invent amounts, percentages, merchants, or categories.",
+            "Avoid generic 10-15% reduction advice unless a specific fact supports it.",
+            "Focus on observations, review areas, and practical next actions grounded in the data.",
+        ],
+    }
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 def find_unusual_expenses(csv_path: str) -> str:
     """
     Find large or unusial expenses to review using merchant-specific thresholds first,
@@ -654,7 +837,7 @@ def prepare_monthly_report_record(
 
     if not advice_text or not advice_text.strip():
         return json.dumps(
-            {"error": "advice_text is empty. Call finance.generate_savings_advice first."},
+            {"error": "advice_text is empty. Call finance.generate_ai_financial_insights first."},
             ensure_ascii=False,
             indent=2,
         )
