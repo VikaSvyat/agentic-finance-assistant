@@ -829,7 +829,8 @@ Required final result:
         else:
             required_workflow = f"""
 Required final result:
-- Analyze only the provided CSV path using finance.analyze_statement.
+- Analyze the persisted transactions table using finance.analyze_statement.
+- If a CSV path is provided, it is only a compatibility fallback.
 - Do not inspect directories.
 - Do not merge statements.
 - Find large expenses to review.
