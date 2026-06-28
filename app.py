@@ -4,13 +4,15 @@ import asyncio
 import json
 import re
 from pathlib import Path
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from agent.agent import run_agent
+from agent.agent import run_agent, run_financial_question
 from agent.config import MAX_TRACE_OUTPUT_LENGTH
+from finance.display import format_merchant_display
 from servers.finance_server import (
     default_db_path,
     load_spending_transactions_from_db,
@@ -62,33 +64,40 @@ div[data-testid="stDataFrame"] { font-size: 0.82rem; }
 st.title("💸 Finance MCP Agent")
 st.caption("Business dashboard powered by MCP tools + LLM orchestration")
 
-input_mode = st.radio("Input mode", ["Single CSV", "Directory"], horizontal=True)
-
-default_goal_single = """
-Analyze this monthly bank statement.
+default_goal_single = """Analyze this monthly bank statement.
 Find spending by category, unusual expenses, savings advice,
 save the report, and store summary in SQLite.
 """
 
-default_goal_directory = """
-Analyze all CSV bank statements in the selected directory as one combined household financial view.
+default_goal_directory = """Analyze all CSV bank statements in the selected directory as one combined household financial view.
 First discover the CSV files using filesystem tools.
 Merge the statements, analyze spending by category, find unusual expenses, generate savings advice,
 save the report, and store summary in SQLite.
 """
 
-if input_mode == "Single CSV":
-    uploaded_file = st.file_uploader("Upload finance file", type=["csv", "xlsx", "xls"])
-    statements_dir = ""
-    goal = st.text_area("User goal", value=default_goal_single, height=105)
-else:
-    uploaded_file = None
-    statements_dir = st.text_input(
-        "Statements directory",
-        value=str(DATA_DIR),
-        help="Example: data/statements or /absolute/path/to/statements",
-    )
-    goal = st.text_area("User goal", value=default_goal_directory, height=125)
+setup_left, setup_right = st.columns([1, 2], gap="large")
+
+with setup_left:
+    st.header("Upload")
+    input_mode = st.radio("Input mode", ["Single CSV", "Directory"], horizontal=True)
+
+    if input_mode == "Single CSV":
+        uploaded_file = st.file_uploader("Upload finance file", type=["csv", "xlsx", "xls"])
+        statements_dir = ""
+    else:
+        uploaded_file = None
+        statements_dir = st.text_input(
+            "Statements directory",
+            value=str(DATA_DIR),
+            help="Example: data/statements or /absolute/path/to/statements",
+        )
+
+with setup_right:
+    st.header("User goal")
+    if input_mode == "Single CSV":
+        goal = st.text_area("User goal", value=default_goal_single, height=105)
+    else:
+        goal = st.text_area("User goal", value=default_goal_directory, height=125)
 
 
 def extract_json_from_step(steps, tool_name):
@@ -160,6 +169,32 @@ def format_money(value):
         return "0.00"
 
 
+def format_report_month(value):
+    if not value or value == "Not selected":
+        return "Not selected"
+
+    try:
+        return datetime.strptime(str(value), "%Y-%m").strftime("%B %Y")
+    except ValueError:
+        return str(value)
+
+
+def friendly_summary_label(kind, value):
+    labels = {
+        "month_field": {
+            "transaction_month": "Purchase/activity month",
+            "cashflow_month": "Bank posting/cashflow month",
+            "statement_month": "Statement month",
+        },
+        "analysis_source": {
+            "transactions_table": "Saved transactions database",
+            "csv_fallback": "Uploaded CSV",
+            "empty": "No transactions found",
+        },
+    }
+    return labels.get(kind, {}).get(value, value or "Unknown")
+
+
 def kpi_card(label, value):
     st.markdown(f"""
     <div class="kpi-card">
@@ -222,6 +257,8 @@ def prepare_merchants_df(analysis):
         "transactions_count": "Transactions",
         "average_transaction": "Avg Transaction",
     })
+    if "Merchant" in df.columns:
+        df["Merchant"] = df["Merchant"].apply(format_merchant_display)
     cols = ["Merchant", "Amount (NIS)", "Transactions", "Avg Transaction"]
     return df[[c for c in cols if c in df.columns]]
 
@@ -238,6 +275,8 @@ def prepare_expenses_df(unusual):
         "threshold": "Threshold",
         "threshold_method": "Method",
     })
+    if "Merchant" in df.columns:
+        df["Merchant"] = df["Merchant"].apply(format_merchant_display)
     cols = ["Date", "Merchant", "Amount (NIS)", "Category", "Threshold", "Method"]
     return df[[c for c in cols if c in df.columns]]
 
@@ -294,6 +333,8 @@ def prepare_transaction_details_df(df: pd.DataFrame) -> pd.DataFrame:
         "source_type": "Source Type",
         "transaction_type": "Transaction Type",
     })
+    if "Merchant" in details.columns:
+        details["Merchant"] = details["Merchant"].apply(format_merchant_display)
     cols = [
         "Transaction Date",
         "Posting Date",
@@ -610,185 +651,323 @@ def render_agent_result(result):
     if not analysis:
         analysis = parse_report_fallback(answer)
 
-    render_transaction_import_summary(transaction_import)
-
     if result.get("monthly_analysis_skipped"):
         st.info(result["monthly_analysis_skipped"])
         return
 
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-    st.header("Financial Summary")
+    report_month = format_report_month(analysis.get("analysis_month") or "Not selected")
+    report_source = friendly_summary_label("analysis_source", analysis.get("analysis_source"))
+    month_field = friendly_summary_label("month_field", analysis.get("month_field"))
 
-    report_month = analysis.get("analysis_month") or "Not selected"
-    report_source = analysis.get("analysis_source") or "unknown"
-    month_field = analysis.get("month_field") or "unknown"
+    overview_tab, analytics_tab, ai_tab, technical_tab = st.tabs(
+        ["Overview", "Analytics", "AI Insights", "Technical"]
+    )
 
-    st.markdown(f"""
-    <div class="business-card">
-        <b>Report month:</b> {report_month}<br>
-        <b>Month basis:</b> {month_field}<br>
-        <b>Analysis source:</b> {report_source}
-    </div>
-    """, unsafe_allow_html=True)
+    with overview_tab:
+        render_transaction_import_summary(transaction_import)
+        st.header("Financial Summary")
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        kpi_card("Total Spent", f"{format_money(analysis.get('total_spent', 0))} NIS")
-    with col2:
-        kpi_card("Transactions", f"{analysis.get('transactions_count', 0)}")
-    with col3:
-        kpi_card("Average Transaction", f"{format_money(analysis.get('average_transaction', 0))} NIS")
+        summary_left, summary_right = st.columns([1, 2], gap="large")
+        with summary_left:
+            st.markdown(f"""
+            <div class="business-card">
+                <b>Report month:</b> {report_month}<br>
+                <b>Spending grouped by:</b> {month_field}<br>
+                <b>Data source:</b> {report_source}
+            </div>
+            """, unsafe_allow_html=True)
+        with summary_right:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                kpi_card("Total Spent", f"{format_money(analysis.get('total_spent', 0))} NIS")
+            with col2:
+                kpi_card("Transactions", f"{analysis.get('transactions_count', 0)}")
+            with col3:
+                kpi_card("Average Transaction", f"{format_money(analysis.get('average_transaction', 0))} NIS")
 
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-    left, right = st.columns(2)
+    with analytics_tab:
+        left, right = st.columns(2, gap="large")
 
-    with left:
-        st.subheader("🏆 Top Categories")
-        categories_df = prepare_categories_df(analysis)
-        if not categories_df.empty:
-            category_selection = st.dataframe(
-                categories_df,
-                use_container_width=True,
-                hide_index=True,
-                key="top_categories_table",
-                on_select="rerun",
-                selection_mode="single-row",
-            )
-            category_index = selected_row_index(category_selection)
-            if category_index is not None:
-                category_items = analysis.get("top_categories", [])
-                if category_index < len(category_items):
-                    selected_category = category_items[category_index]
-                    details = report_transactions_df(report_month)
-                    details = details[
-                        details["normalized_category"] == selected_category.get("category")
-                    ]
-                    render_transaction_details(
-                        f"Details for {selected_category.get('category_en', 'selected category')}",
-                        details,
-                    )
-        else:
-            st.info("No category data found.")
-
-    with right:
-        st.subheader("🛒 Top Merchants")
-        merchants_df = prepare_merchants_df(analysis)
-        if not merchants_df.empty:
-            merchant_selection = st.dataframe(
-                merchants_df,
-                use_container_width=True,
-                hide_index=True,
-                key="top_merchants_table",
-                on_select="rerun",
-                selection_mode="single-row",
-            )
-            merchant_index = selected_row_index(merchant_selection)
-            if merchant_index is not None:
-                merchant_items = analysis.get("top_merchants", [])
-                if merchant_index < len(merchant_items):
-                    selected_merchant = merchant_items[merchant_index]
-                    details = report_transactions_df(report_month)
-                    details = details[
-                        details["merchant"] == selected_merchant.get("merchant")
-                    ]
-                    render_transaction_details(
-                        f"Details for {selected_merchant.get('merchant', 'selected merchant')}",
-                        details,
-                    )
-        else:
-            st.info("No merchant data found.")
-
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-    st.subheader("⚠️ Large Expenses to Review")
-    expenses_df = prepare_expenses_df(unusual)
-    if not expenses_df.empty:
-        expense_selection = st.dataframe(
-            expenses_df,
-            use_container_width=True,
-            hide_index=True,
-            key="large_expenses_table",
-            on_select="rerun",
-            selection_mode="single-row",
-        )
-        expense_index = selected_row_index(expense_selection)
-        if expense_index is not None:
-            expense_items = unusual.get("large_expenses_to_review", []) if unusual else []
-            if expense_index < len(expense_items):
-                selected_expense = expense_items[expense_index]
-                details = report_transactions_df(report_month)
-                selected_amount = float(selected_expense.get("amount", 0) or 0)
-                details = details[
-                    (details["transaction_date"] == selected_expense.get("transaction_date")) &
-                    (details["merchant"] == selected_expense.get("merchant")) &
-                    ((details["amount"] - selected_amount).abs() <= 0.01)
-                ]
-                render_transaction_details(
-                    f"Details for {selected_expense.get('merchant', 'selected expense')}",
-                    details,
+        with left:
+            st.subheader("🏆 Top Categories")
+            categories_df = prepare_categories_df(analysis)
+            if not categories_df.empty:
+                category_selection = st.dataframe(
+                    categories_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    key="top_categories_table",
+                    on_select="rerun",
+                    selection_mode="single-row",
                 )
+                category_index = selected_row_index(category_selection)
+                if category_index is not None:
+                    category_items = analysis.get("top_categories", [])
+                    if category_index < len(category_items):
+                        selected_category = category_items[category_index]
+                        details = report_transactions_df(report_month)
+                        details = details[
+                            details["normalized_category"] == selected_category.get("category")
+                        ]
+                        render_transaction_details(
+                            f"Details for {selected_category.get('category_en', 'selected category')}",
+                            details,
+                        )
+            else:
+                st.info("No category data found.")
+
+        with right:
+            st.subheader("🛒 Top Merchants")
+            merchants_df = prepare_merchants_df(analysis)
+            if not merchants_df.empty:
+                merchant_selection = st.dataframe(
+                    merchants_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    key="top_merchants_table",
+                    on_select="rerun",
+                    selection_mode="single-row",
+                )
+                merchant_index = selected_row_index(merchant_selection)
+                if merchant_index is not None:
+                    merchant_items = analysis.get("top_merchants", [])
+                    if merchant_index < len(merchant_items):
+                        selected_merchant = merchant_items[merchant_index]
+                        details = report_transactions_df(report_month)
+                        details = details[
+                            details["merchant"] == selected_merchant.get("merchant")
+                        ]
+                        render_transaction_details(
+                            f"Details for {format_merchant_display(selected_merchant.get('merchant', 'selected merchant'))}",
+                            details,
+                        )
+            else:
+                st.info("No merchant data found.")
+
+        st.subheader("⚠️ Large Expenses to Review")
+        expenses_df = prepare_expenses_df(unusual)
+        if not expenses_df.empty:
+            expense_selection = st.dataframe(
+                expenses_df,
+                use_container_width=True,
+                hide_index=True,
+                key="large_expenses_table",
+                on_select="rerun",
+                selection_mode="single-row",
+            )
+            expense_index = selected_row_index(expense_selection)
+            if expense_index is not None:
+                expense_items = unusual.get("large_expenses_to_review", []) if unusual else []
+                if expense_index < len(expense_items):
+                    selected_expense = expense_items[expense_index]
+                    details = report_transactions_df(report_month)
+                    selected_amount = float(selected_expense.get("amount", 0) or 0)
+                    details = details[
+                        (details["transaction_date"] == selected_expense.get("transaction_date")) &
+                        (details["merchant"] == selected_expense.get("merchant")) &
+                        ((details["amount"] - selected_amount).abs() <= 0.01)
+                    ]
+                    render_transaction_details(
+                        f"Details for {format_merchant_display(selected_expense.get('merchant', 'selected expense'))}",
+                        details,
+                    )
+        else:
+            st.success("No large expenses detected.")
+
+    with ai_tab:
+        st.header("AI Insights")
+        if ai_insights:
+            st.markdown(ai_insights)
+        else:
+            st.info("AI insights were not generated for this run.")
+
+    with technical_tab:
+        with st.expander("🔧 Technical Agent Trace", expanded=False):
+            st.caption("This section demonstrates MCP tool orchestration.")
+
+            rows = []
+            for step in steps:
+                obs = step.get("observation", {})
+                timing = step.get("timing", {})
+                rows.append({
+                    "Step": step.get("step"),
+                    "Tool": step.get("tool"),
+                    "Status": step_status(step),
+                    "LLM (s)": timing.get("llm_response_seconds", ""),
+                    "Tool (s)": timing.get("tool_execution_seconds", ""),
+                    "Total (s)": timing.get("total_step_seconds", ""),
+                    "Reason": step.get("reason", ""),
+                    "Error": obs.get("error", "") if isinstance(obs, dict) else "",
+                })
+
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+            st.subheader("Raw Step Details")
+            for step in steps:
+                with st.expander(f"{step_status(step)} | Step {step.get('step')}: {step.get('tool')}", expanded=False):
+                    st.write("Reason:")
+                    st.write(step.get("reason", ""))
+
+                    if "args" in step:
+                        st.write("Args:")
+                        st.json(truncate_trace_payload(step["args"]))
+
+                    if "observation" in step:
+                        st.write("Observation:")
+                        st.json(truncate_trace_payload(step["observation"]))
+
+                    if "output" in step:
+                        st.write("Output:")
+                        st.markdown(truncate_trace_value(step["output"]))
+
+
+def render_financial_qa():
+    st.header("Financial Questions")
+    st.caption("Ask a question about your saved transaction history.")
+
+    spending_insight_examples = [
+        "Where is most of my money actually going?",
+        "What changed the most between May and June?",
+        "Which expenses deserve a second look?",
+    ]
+
+    recurring_commitment_examples = [
+        "Which recurring payments are real financial obligations and which are just payment methods?",
+        "What are my biggest recurring financial commitments?",
+        "Which recurring payments would you never recommend cutting?",
+    ]
+
+    ai_review_examples = [
+        "If you could give me only one piece of financial advice, what would it be?",
+        "What spending habit would save me the most money over time?",
+        "Which expenses look expensive, but are actually perfectly normal?",
+        "If you knew nothing about me except these transactions, what would you guess about my lifestyle?",
+    ]
+
+    def example_selector(label: str, options: list[str], key: str):
+        st.caption(label)
+        if hasattr(st, "pills"):
+            return st.pills(
+                label,
+                options,
+                selection_mode="single",
+                key=key,
+                label_visibility="collapsed",
+            )
+        return st.selectbox(
+            label,
+            options,
+            index=None,
+            key=key,
+            placeholder="Choose an example",
+        )
+
+    selected_spending_example = example_selector(
+        "📊 Spending Insights",
+        spending_insight_examples,
+        "spending_insight_question_example",
+    )
+    selected_commitment_example = example_selector(
+        "💳 Recurring Commitments",
+        recurring_commitment_examples,
+        "recurring_commitment_question_example",
+    )
+    selected_ai_review_example = example_selector(
+        "🤖 AI Financial Review",
+        ai_review_examples,
+        "ai_review_question_example",
+    )
+    selected_example = (
+        selected_ai_review_example
+        or selected_commitment_example
+        or selected_spending_example
+    )
+    if selected_example:
+        st.session_state["financial_qa_question"] = selected_example
+
+    qa_question = st.text_input(
+        "Ask a question about your transaction history",
+        key="financial_qa_question",
+        placeholder="Compare May and June spending.",
+    )
+
+    if st.button("Ask", disabled=not qa_question.strip()):
+        with st.spinner("Answering from transaction history..."):
+            st.session_state["last_financial_qa"] = asyncio.run(
+                run_financial_question(qa_question.strip())
+            )
+
+    if st.session_state.get("last_financial_qa"):
+        qa_result = st.session_state["last_financial_qa"]
+        response_mode = qa_result.get("response_mode", "interpretive")
+        answer_labels = {
+            "deterministic": "📊 Deterministic Answer",
+            "interpretive": "🤖 AI Interpretation",
+            "insight": "🤖 AI Interpretation",
+        }
+        answer_label = answer_labels.get(response_mode, "🤖 AI Interpretation")
+        st.markdown(f"""
+        <div class="business-card">
+            <b>Question:</b> {qa_result.get("question", "")}<br>
+            <b>Tool selected:</b> {qa_result.get("tool", "")}<br>
+            <b>Answer mode:</b> {answer_label}<br>
+            <b>Insight subtype:</b> {qa_result.get("insight_subtype", "") or "n/a"}
+        </div>
+        """, unsafe_allow_html=True)
+        st.subheader(answer_label)
+        key_facts = qa_result.get("key_facts", "")
+        if response_mode == "insight" and key_facts:
+            st.markdown(key_facts)
+            st.markdown("**AI Commentary**")
+        st.markdown(qa_result.get("answer", ""))
+
+        # Show the NLP decision path for demos, debugging, and project review.
+        with st.expander("NLP debug path", expanded=False):
+            nlp_debug = qa_result.get("nlp_debug", {})
+            st.write(f"deterministic_router = {nlp_debug.get('deterministic_router', 'n/a')}")
+            st.write(f"llm_classifier_used = {nlp_debug.get('llm_classifier_used', 'n/a')}")
+            st.write(f"subtype = {nlp_debug.get('subtype', qa_result.get('insight_subtype') or 'n/a')}")
+            st.write(f"focused_context_keys = {nlp_debug.get('focused_context_keys', [])}")
+            st.write(f"guard = {nlp_debug.get('guard', 'n/a')}")
+            st.json(nlp_debug)
+
+        with st.expander("Raw JSON result", expanded=False):
+            raw_result = qa_result.get("raw_result", "")
+            try:
+                st.json(json.loads(raw_result))
+            except Exception:
+                st.code(str(raw_result))
+
+
+st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+run_col, status_col = st.columns([1, 3])
+with run_col:
+    run_clicked = st.button("🚀 Run Agent", disabled=not can_run, use_container_width=True)
+with status_col:
+    if st.session_state.get("last_agent_result"):
+        st.success("Agent result is loaded. Use the tabs below to review it.")
+    elif input_mode == "Single CSV":
+        st.info("Run the agent with saved transactions, or upload a new finance file first.")
     else:
-        st.success("No large expenses detected.")
+        st.info("Enter a directory path containing finance statements.")
 
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-    st.header("AI Insights")
-
-    if ai_insights:
-        st.markdown(ai_insights)
-    else:
-        st.info("AI insights were not generated for this run.")
-
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-
-    with st.expander("🔧 Technical Agent Trace", expanded=False):
-        st.caption("This section demonstrates MCP tool orchestration.")
-
-        rows = []
-        for step in steps:
-            obs = step.get("observation", {})
-            timing = step.get("timing", {})
-            rows.append({
-                "Step": step.get("step"),
-                "Tool": step.get("tool"),
-                "Status": step_status(step),
-                "LLM (s)": timing.get("llm_response_seconds", ""),
-                "Tool (s)": timing.get("tool_execution_seconds", ""),
-                "Total (s)": timing.get("total_step_seconds", ""),
-                "Reason": step.get("reason", ""),
-                "Error": obs.get("error", "") if isinstance(obs, dict) else "",
-            })
-
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        st.subheader("Raw Step Details")
-        for step in steps:
-            with st.expander(f"{step_status(step)} | Step {step.get('step')}: {step.get('tool')}", expanded=False):
-                st.write("Reason:")
-                st.write(step.get("reason", ""))
-
-                if "args" in step:
-                    st.write("Args:")
-                    st.json(truncate_trace_payload(step["args"]))
-
-                if "observation" in step:
-                    st.write("Observation:")
-                    st.json(truncate_trace_payload(step["observation"]))
-
-                if "output" in step:
-                    st.write("Output:")
-                    st.markdown(truncate_trace_value(step["output"]))
-
-
-if st.button("🚀 Run Agent", disabled=not can_run):
+if run_clicked:
     with st.spinner("Agent is working..."):
         result = run_selected_agent()
 
     if result:
         st.session_state["last_agent_result"] = result
 
-if st.session_state.get("last_agent_result"):
-    render_agent_result(st.session_state["last_agent_result"])
-elif input_mode == "Single CSV":
-    st.info("Run the agent with saved transactions, or upload a new finance file first.")
-else:
-    st.info("Enter a directory path containing finance statements.")
+overview_area, qa_area = st.tabs(["Dashboard", "Financial Q&A"])
+
+with overview_area:
+    if st.session_state.get("last_agent_result"):
+        render_agent_result(st.session_state["last_agent_result"])
+    elif input_mode == "Single CSV":
+        st.info("Run the agent with saved transactions, or upload a new finance file first.")
+    else:
+        st.info("Enter a directory path containing finance statements.")
+
+with qa_area:
+    render_financial_qa()

@@ -5,11 +5,19 @@ import os
 import hashlib
 import sqlite3
 import re
+import sys
 from html.parser import HTMLParser
 from pathlib import Path
 from datetime import datetime
 from zipfile import ZipFile
 from xml.etree import ElementTree as ET
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from finance import query_tools
+from finance.display import format_merchant_display
 
 # This file is the deterministic finance layer of the app.
 # The LLM can choose these MCP tools, but the calculations themselves happen here.
@@ -455,22 +463,22 @@ def classify_bank_transaction(description: object, expanded: object, direction: 
     if direction == "debit" and is_rent_or_utility_payment(description, expanded):
         return "housing_utility_expense"
 
-    if any(keyword.casefold() in text for keyword in ["כרטיס דביט", "דביט", "debit card", "дебетовая карта"]):
+    if any(keyword.casefold() in text for keyword in ["כרטיס דביט", "דביט", "debit card"]):
         return "real_expense"
 
     if any(keyword.casefold() in text for keyword in ["national visa", "כרטיס אשראי", "ויזה", "visa", "max", "מקס", "לאומי קארד"]):
         return "card_settlement"
 
-    if any(keyword.casefold() in text for keyword in ["הוראת קבע", "standing order", "постоянное поручение"]):
+    if any(keyword.casefold() in text for keyword in ["הוראת קבע", "standing order"]):
         return "standing_order"
 
-    if any(keyword.casefold() in text for keyword in ["salary", "משכורת", "зарплата"]):
+    if any(keyword.casefold() in text for keyword in ["salary", "משכורת"]):
         return "salary_income"
 
     if any(keyword.casefold() in text for keyword in ["ביטוח לאומי", "national insurance"]):
         return "government_income"
 
-    if any(keyword.casefold() in text for keyword in ["העברה", "transfer", "перевод", "הע. אינטרנט"]):
+    if any(keyword.casefold() in text for keyword in ["העברה", "transfer", "הע. אינטרנט"]):
         return "bank_transfer" if direction == "debit" else "internal_transfer"
 
     return "unknown"
@@ -1820,61 +1828,121 @@ def analyze_statement(csv_path: str = "", analysis_month: str = "") -> str:
 
 # MCP tool: focused category aggregation, useful if the agent needs only category data.
 @mcp.tool()
-def get_category_breakdown(csv_path: str = "", analysis_month: str = "") -> str:
+def get_spending_summary(month: str = "") -> str:
+    """
+    Return read-only spending summary for one transaction_month.
+    """
+
+    result = query_tools.get_spending_summary(month=month)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# MCP tool: focused category aggregation for transaction-history questions.
+@mcp.tool()
+def get_category_breakdown(month: str = "", csv_path: str = "", analysis_month: str = "") -> str:
     """
     Return spending grouped by normalized category.
     """
 
-    df = load_analytics_spending_df(csv_path, analysis_month)
-
-    grouped = (
-        df.groupby(["normalized_category", "normalized_category_en"])["amount"]
-        .agg(["sum", "count", "mean"])
-        .sort_values("sum", ascending=False)
-        .reset_index()
-    )
-
-    result = []
-
-    for _, row in grouped.iterrows():
-        result.append(
-            {
-                "category": row["normalized_category"],
-                "category_en": row["normalized_category_en"],
-                "total_amount": round(float(row["sum"]), 2),
-                "transactions_count": int(row["count"]),
-                "average_transaction": round(float(row["mean"]), 2),
-            }
-        )
+    selected_month = month or analysis_month
+    result = query_tools.get_category_breakdown(month=selected_month)
 
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-# MCP tool: focused merchant aggregation, useful for reviewing repeated spending.
+# MCP tool: focused merchant aggregation for transaction-history questions.
 @mcp.tool()
-def get_top_merchants(csv_path: str = "", limit: int = 10, analysis_month: str = "") -> str:
+def get_top_merchants(month: str = "", limit: int = 10, csv_path: str = "", analysis_month: str = "") -> str:
     """
     Return top merchants by total spending.
     """
-    df = load_analytics_spending_df(csv_path, analysis_month)
+    selected_month = month or analysis_month
+    result = query_tools.get_top_merchants(month=selected_month, limit=limit)
 
-    grouped = (
-        df.groupby("merchant")["amount"]
-        .agg(["sum", "count", "mean"])
-        .sort_values("sum", ascending=False)
-        .head(limit)
-        .reset_index()
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def get_largest_transactions(month: str = "", limit: int = 10) -> str:
+    """
+    Return largest transactions for one transaction_month.
+    """
+
+    result = query_tools.get_largest_transactions(month=month, limit=limit)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def get_unusual_transactions(month: str = "") -> str:
+    """
+    Return unusual transactions for one transaction_month using deterministic thresholds.
+    """
+
+    result = query_tools.get_unusual_transactions(month=month)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def compare_months(month_a: str, month_b: str) -> str:
+    """
+    Compare spending between two transaction_month values.
+    """
+
+    result = query_tools.compare_months(month_a=month_a, month_b=month_b)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def get_category_comparison(category: str, month_a: str, month_b: str) -> str:
+    """
+    Compare one normalized category between two transaction_month values.
+    """
+
+    result = query_tools.get_category_comparison(
+        category=category,
+        month_a=month_a,
+        month_b=month_b,
     )
-    result = [
-        {
-            "merchant": row["merchant"],
-            "total_amount": round(float(row["sum"]), 2),
-            "transactions_count": int(row["count"]),
-            "average_transaction": round(float(row["mean"]), 2),
-        }
-        for _, row in grouped.iterrows()
-    ]
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
+
+@mcp.tool()
+def get_category_trend(category: str, months: int = 6) -> str:
+    """
+    Return monthly totals for a category across recent months.
+    """
+
+    result = query_tools.get_category_trend(category=category, months=months)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def get_recurring_merchants(months: int = 6) -> str:
+    """
+    Return merchants that appear in multiple recent months.
+    """
+
+    result = query_tools.get_recurring_merchants(months=months)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def prepare_financial_review_context(months: int = 6) -> str:
+    """
+    Return deterministic multi-month context for financial review questions.
+    """
+
+    result = query_tools.prepare_financial_review_context(months=months)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def search_transactions(keyword: str, limit: int = 50) -> str:
+    """
+    Search transaction history by merchant, description, category, or counterparty.
+    """
+
+    result = query_tools.search_transactions(keyword=keyword, limit=limit)
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
@@ -1911,7 +1979,7 @@ def generate_monthly_report(analysis_json: str, unusual_json: str, advice_text: 
     lines.append("## Top Merchants")
     for item in analysis.get("top_merchants", [])[:5]:
         lines.append(
-            f"- {item.get('merchant')}: {item.get('total_amount', 0):.2f} NIS "
+            f"- {format_merchant_display(item.get('merchant'))}: {item.get('total_amount', 0):.2f} NIS "
             f"({item.get('transactions_count', 0)} transactions)"
         )
 
@@ -1922,7 +1990,7 @@ def generate_monthly_report(analysis_json: str, unusual_json: str, advice_text: 
     if large_expenses:
         for item in large_expenses[:5]:
             lines.append(
-                f"- {item.get('transaction_date')}: {item.get('merchant')} — "
+                f"- {item.get('transaction_date')}: {format_merchant_display(item.get('merchant'))} — "
                 f"{item.get('amount')} NIS ({item.get('normalized_category_en')})"
             )
     else:
@@ -2316,7 +2384,7 @@ def generate_savings_advice(analysis_json: str, unusual_json: str) -> str:
         advice.append("Top merchants to review:")
         for merchant in top_merchants[:5]:
             advice.append(
-                f"- {merchant.get('merchant')}: {merchant.get('total_amount', 0):.2f} NIS "
+                f"- {format_merchant_display(merchant.get('merchant'))}: {merchant.get('total_amount', 0):.2f} NIS "
                 f"across {merchant.get('transactions_count', 0)} transactions"
             )
 
@@ -2327,7 +2395,7 @@ def generate_savings_advice(analysis_json: str, unusual_json: str) -> str:
         advice.append("Large or unusial expenses to review:")
         for item in large_expenses[:5]:
             advice.append(
-                f"- {item.get('transaction_date')}: {item.get('merchant')} — "
+                f"- {item.get('transaction_date')}: {format_merchant_display(item.get('merchant'))} — "
                 f"{item.get('amount')} NIS ({item.get('normalized_category_en')})"
             )
 
