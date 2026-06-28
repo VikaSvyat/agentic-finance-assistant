@@ -1,8 +1,9 @@
 import os
 from dotenv import load_dotenv
 
+from agent.runtime_config import load_runtime_config
 
-load_dotenv()
+load_runtime_config()
 
 
 def env_bool(name: str, default: bool = False) -> bool:

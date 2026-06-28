@@ -8,6 +8,9 @@ from typing import Any
 
 import pandas as pd
 
+from agent.runtime_config import load_runtime_config
+
+load_runtime_config()
 
 BASE_ANALYTICS_CURRENCY = "NIS"
 ACTIVE_ANALYTICS_WHERE = "COALESCE(analytics_excluded, 0) = 0"

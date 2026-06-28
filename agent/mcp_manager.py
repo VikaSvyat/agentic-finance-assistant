@@ -1,13 +1,15 @@
 import os
+import sys
 import json
 import asyncio
 from contextlib import AsyncExitStack
 from dotenv import load_dotenv
 
+from agent.runtime_config import PROJECT_ROOT, load_runtime_config
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-load_dotenv()
+load_runtime_config()
 
 
 class MCPManager:
@@ -19,6 +21,7 @@ class MCPManager:
     async def connect(self):
         data_dir = os.getenv("DATA_DIR", "./data")
         db_path = os.getenv("DB_PATH", "./database/finance.db")
+        finance_server_path = PROJECT_ROOT / "servers" / "finance_server.py"
 
         servers = {
             "filesystem": StdioServerParameters(
@@ -38,9 +41,9 @@ class MCPManager:
                 ],
             ),
             "finance": StdioServerParameters(
-                command="python",
+                command=sys.executable,
                 args=[
-                    "servers/finance_server.py",
+                    str(finance_server_path),
                 ],
             ),
         }

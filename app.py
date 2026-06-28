@@ -10,6 +10,10 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+from agent.runtime_config import PROJECT_ROOT, load_runtime_config
+
+load_runtime_config()
+
 from agent.agent import run_agent, run_financial_question
 from agent.config import MAX_TRACE_OUTPUT_LENGTH
 from finance.display import format_merchant_display
@@ -24,9 +28,8 @@ from servers.finance_server import (
 
 load_dotenv()
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
-DATA_DIR.mkdir(exist_ok=True)
-PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT / "data")))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR_RESOLVED = DATA_DIR.resolve()
 
 st.set_page_config(page_title="Finance MCP Agent", page_icon="💸", layout="wide")

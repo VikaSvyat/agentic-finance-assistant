@@ -16,8 +16,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from agent.runtime_config import load_runtime_config
 from finance import query_tools
 from finance.display import format_merchant_display
+
+load_runtime_config()
 
 # This file is the deterministic finance layer of the app.
 # The LLM can choose these MCP tools, but the calculations themselves happen here.

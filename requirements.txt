@@ -1,6 +1,9 @@
 groq==1.4.0
 mcp==1.27.2
+openpyxl
 pandas==3.0.3
 python-dotenv==1.2.2
+requests
 streamlit==1.58.0
 uvicorn==0.48.0
+xlrd

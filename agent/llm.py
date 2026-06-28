@@ -4,7 +4,9 @@ import requests
 from groq import Groq
 from dotenv import load_dotenv
 
-load_dotenv()
+from agent.runtime_config import load_runtime_config
+
+load_runtime_config()
 
 logger = logging.getLogger(__name__)
 

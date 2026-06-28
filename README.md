@@ -245,6 +245,55 @@ Run the Streamlit app:
 streamlit run app.py
 ```
 
+## Streamlit Community Cloud Deployment
+
+The app can run on Streamlit Community Cloud while keeping the current MCP architecture.
+The deployment uses Python MCP code plus Node-based MCP servers started through `npx`.
+
+### Cloud files
+
+The repository includes:
+
+- `requirements.txt` for Python dependencies.
+- `packages.txt` for system packages required by the Node-based MCP servers.
+
+`packages.txt` must contain:
+
+```text
+nodejs
+npm
+```
+
+### Streamlit Secrets
+
+Configure these values in the Streamlit Cloud app settings.
+Do not commit real secrets to the repository.
+
+```toml
+LLM_PROVIDER = "groq"
+MODEL = "llama-3.1-8b-instant"
+GROQ_API_KEY = "your-groq-api-key"
+
+DATA_DIR = "./data"
+DB_PATH = "./database/finance.db"
+
+FAST_DEV_MODE = false
+FAST_DEV_SKIP_SQLITE = false
+```
+
+The application copies supported Streamlit secrets into environment variables when
+the corresponding environment variable is not already set. Local `.env` files still
+work for development.
+
+### Deployment limitations
+
+- Groq is required in Streamlit Cloud. Ollama is local-only because the cloud app
+  cannot access a local `localhost:11434` Ollama server.
+- SQLite is used as demo/session storage. It is suitable for project demos, but it
+  should not be treated as durable production storage on Streamlit Cloud.
+- Node/npm are required because the app starts the filesystem and SQLite MCP
+  servers through `npx`.
+
 ## Developer Utilities
 
 List SQLite MCP tools:
