@@ -53,6 +53,14 @@ from agent.tool_registry import (
     tools_for_current_mode,
     tools_to_text,
 )
+from agent.tool_results import (
+    action_for_history,
+    make_observation,
+    memory_state_text,
+    prune_messages,
+    remember_tool_output,
+    truncate_text,
+)
 from finance.display import format_merchant_display
 
 load_dotenv()
@@ -108,213 +116,6 @@ def extract_json(text: str) -> dict[str, Any]:
 
     return obj
 
-
-def action_for_history(action: dict[str, Any]) -> dict[str, Any]:
-    """
-    Keep conversation history small.
-
-    Python injects stored tool outputs into dependent tools, so the LLM should
-    not carry large JSON strings forward in assistant messages.
-    """
-
-    tool_name = action.get("tool")
-    args = action.get("args", {})
-
-    memory_injected_tools = {
-        "finance.generate_savings_advice",
-        "finance.prepare_financial_insight_context",
-        "finance.generate_ai_financial_insights",
-        "finance.generate_monthly_report",
-        "finance.prepare_monthly_report_record",
-        "sqlite.create_record",
-    }
-
-    if tool_name in memory_injected_tools:
-        args = {}
-
-    return {
-        "tool": tool_name,
-        "args": args if isinstance(args, dict) else {},
-        "reason": action.get("reason", ""),
-    }
-
-
-def truncate_text(value: str, limit: int = MAX_TOOL_OUTPUT_LENGTH) -> str:
-    """
-    Keep observations compact for LLM context and logs.
-    Full tool outputs are still kept in internal memory when needed.
-    """
-
-    text = str(value)
-
-    if len(text) <= limit:
-        return text
-
-    omitted = len(text) - limit
-    return f"{text[:limit]}\n... [truncated {omitted} chars]"
-
-
-def prune_messages(messages: list[Message]) -> list[Message]:
-    """
-    Keep the initial system/user context and only the latest runtime messages.
-    This prevents prompt growth during long or error-prone agent loops.
-    """
-
-    if len(messages) <= 2 + MAX_HISTORY_MESSAGES:
-        return messages
-
-    return messages[:2] + messages[-MAX_HISTORY_MESSAGES:]
-
-
-def memory_state_text(memory: Memory, csv_path: str) -> str:
-    return f"""
-Internal state:
-- analysis_json available: {bool(memory.get("analysis_json"))}
-- unusual_json available: {bool(memory.get("unusual_json"))}
-- advice_text available: {bool(memory.get("advice_text"))}
-- financial_insight_context available: {bool(memory.get("financial_insight_context"))}
-- ai_insights_text available: {bool(memory.get("ai_insights_text"))}
-- monthly_report available: {bool(memory.get("monthly_report"))}
-- monthly_report_record available: {bool(memory.get("monthly_report_record"))}
-- discovered csv_files count: {len(memory.get("csv_files", []))}
-- effective csv_path available: {bool(memory.get("csv_path") or csv_path)}
-"""
-
-### It saves the full result of tool into Python's internal memory.
-# Because in LLM we only send a preview 
-# # and the full result remains inside Python and is then passed to the next tool.
-
-def extract_csv_paths_from_filesystem_output(result: str, statements_dir: str = "") -> list[str]:
-    """
-    Extract CSV file paths from common filesystem MCP outputs.
-
-    Supports:
-    - JSON lists
-    - JSON objects with entries/files/items
-    - dict items with path/name/file/filename
-    - plain text directory listings
-    """
-
-    csv_files = []
-
-    def normalize_path(value: str) -> str:
-        value = str(value).strip().strip('"').strip("'")
-
-        if not value.lower().endswith(".csv"):
-            return ""
-
-        # already absolute path
-        if value.startswith("/"):
-            return value
-
-        # already contains directory
-        if "/" in value:
-            return value
-
-        # discovered file name only
-        if statements_dir:
-            return str(Path(statements_dir) / value)
-
-        # fallback for current project structure
-        return str(Path("data") / value)
-
-    try:
-        data = json.loads(result)
-
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            items = data.get("entries") or data.get("files") or data.get("items") or []
-        else:
-            items = []
-
-        for item in items:
-            if isinstance(item, str):
-                path = normalize_path(item)
-                if path:
-                    csv_files.append(path)
-            elif isinstance(item, dict):
-                candidate = (
-                    item.get("path")
-                    or item.get("name")
-                    or item.get("file")
-                    or item.get("filename")
-                )
-                if candidate:
-                    path = normalize_path(candidate)
-                    if path:
-                        csv_files.append(path)
-
-    except Exception:
-        for line in str(result).splitlines():
-            line = line.strip()
-
-            # Filesystem MCP often returns lines like:
-            # [FILE] bank_statement_may.csv
-            # [DIR] statements
-            if line.startswith("[DIR]"):
-                continue
-
-            if line.startswith("[FILE]"):
-                line = line.replace("[FILE]", "", 1).strip()
-
-            line = line.strip("-").strip()
-
-            path = normalize_path(line)
-
-            if path:
-                csv_files.append(path)
-
-    return list(dict.fromkeys(csv_files))
-
-
-def remember_tool_output(tool_name: str, result: str, memory: Memory) -> None:
-    """
-    Store full tool outputs internally.
-    These are NOT fully sent back to the LLM, but we can reuse them safely.
-    """
-
-    if tool_name == "finance.analyze_statement":
-        memory["analysis_json"] = result
-
-    elif tool_name == "finance.find_unusual_expenses":
-        memory["unusual_json"] = result
-
-    elif tool_name == "finance.generate_savings_advice":
-        memory["advice_text"] = result
-
-    elif tool_name == "finance.prepare_financial_insight_context":
-        memory["financial_insight_context"] = result
-
-    elif tool_name == "finance.generate_ai_financial_insights":
-        memory["ai_insights_text"] = result
-        memory["advice_text"] = result
-
-    elif tool_name == "finance.generate_monthly_report":
-        memory["monthly_report"] = result
-
-    elif tool_name == "finance.prepare_monthly_report_record":
-        memory["monthly_report_record"] = result
-
-    elif tool_name == "finance.merge_statements":
-        try:
-            data = json.loads(result)
-            merged_path = data.get("merged_csv_path") or data.get("csv_path")
-            if merged_path:
-                memory["csv_path"] = merged_path
-                memory["merged_csv_path"] = merged_path
-        except Exception:
-            pass
-
-    elif tool_name.startswith("filesystem."):
-        memory.setdefault("filesystem_outputs", []).append(result)
-        discovered = extract_csv_paths_from_filesystem_output(
-            result,
-            memory.get("statements_dir", ""),
-        )
-        if discovered:
-            existing = memory.get("csv_files", [])
-            memory["csv_files"] = list(dict.fromkeys(existing + discovered))
 
 INSIGHT_INTENT_MARKERS = {
     "mortgage_review": [
@@ -2357,36 +2158,6 @@ def format_deterministic_answer(question: str, tool_name: str, raw_result: str) 
         )
 
     return "Tool JSON result:\n```json\n" + json.dumps(data, ensure_ascii=False, indent=2) + "\n```"
-
-### This function makes a short message to LLM after calling tool
-# Why a preview and not a full result? 
-# To avoid spending too many Groq tokens.
-# The full result is stored in memory.
-def make_observation(
-    tool_name: str,
-    result: str,
-    ok: bool = True,
-    error: str | None = None,
-) -> dict[str, Any]:
-    """
-    Create a compact observation for the LLM.
-    Full results are stored separately in memory.
-    """
-
-    if not ok:
-        return {
-            "tool": tool_name,
-            "ok": False,
-            "error": error,
-        }
-
-    return {
-        "tool": tool_name,
-        "ok": True,
-        "output_preview": truncate_text(result),
-        "full_output": str(result),
-    }
-
 
 def enforce_currency_text(text: str, currency: str = "NIS") -> str:
     """Normalize obvious currency wording mistakes in interpretive answers."""
