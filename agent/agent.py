@@ -58,6 +58,7 @@ from agent.insight_context import build_insight_context
 from agent.llm import call_llm
 from agent.mcp_manager import MCPManager, short_json
 from agent.prompts import SYSTEM_PROMPT, insight_prompt_instructions
+from agent.report_generation import execute_ai_insights_step_impl
 from agent.routing import (
     FINANCIAL_REVIEW_SUBTYPES,
     classify_financial_intent,
@@ -550,132 +551,15 @@ Tool observation:
         raw_args: Any,
         reason: str,
     ) -> AgentResult | None:
-        args = build_args_for_tool(
-            "finance.generate_ai_financial_insights",
-            raw_args,
-            self.csv_path,
-            self.memory,
-        )
-        currency = "NIS"
-        try:
-            financial_context = json.loads(args.get("financial_context_json", "{}"))
-            currency = financial_context.get("currency") or currency
-        except Exception:
-            pass
-
-        insight_start = time.perf_counter()
-        insight_text = call_llm(
-            [
-                {
-                    "role": "system",
-                    "content": """
-You are a financial insight writer.
-Use only the provided deterministic financial context.
-Do not calculate new totals.
-Do not invent merchants, categories, amounts, or percentages.
-The only valid currency is the currency field from the context.
-For this run, write every monetary amount in NIS/shekel terms only.
-Never use $, USD, dollars, or any other foreign currency label.
-Avoid generic advice such as "reduce spending by 10-15%".
-Write 3-5 concise personalized observations and practical recommendations.
-Ground every recommendation in the provided data.
-""",
-                },
-                {
-                    "role": "user",
-                    "content": f"""
-Prepared financial context JSON:
-{args.get("financial_context_json", "")}
-
-Spending summary JSON:
-{args.get("analysis_json", "")}
-
-Unusual expenses JSON:
-{args.get("unusual_json", "")}
-
-Return a concise markdown section with:
-- 3-5 personalized observations
-- practical recommendations
-- explanation of spending patterns
-- potential areas for review
-""",
-                },
-            ]
-        )
-        insight_text = enforce_currency_text(insight_text, currency)
-        insight_duration = time.perf_counter() - insight_start
-        total_duration = time.perf_counter() - step_start
-
-        remember_tool_output(
-            "finance.generate_ai_financial_insights",
-            insight_text,
-            self.memory,
-        )
-        self.tool_results["finance.generate_ai_financial_insights"] = insight_text
-
-        observation = make_observation(
-            tool_name="finance.generate_ai_financial_insights",
-            result=insight_text,
-            ok=True,
-        )
-
-        step_record: Step = {
-            "step": step_number,
-            "tool": "finance.generate_ai_financial_insights",
-            "args": args,
-            "reason": reason,
-            "observation": observation,
-            "timing": {
-                "llm_response_seconds": round(llm_duration, 3),
-                "tool_execution_seconds": round(insight_duration, 3),
-                "total_step_seconds": round(total_duration, 3),
-            },
-        }
-        self.steps.append(step_record)
-
-        logger.info(
-            "RESULT tool=%s output=%s",
-            "finance.generate_ai_financial_insights",
-            short_json(observation),
-        )
-        logger.info(
-            "TIMING step=%s tool=%s llm=%.3fs tool=%.3fs total=%.3fs",
+        return execute_ai_insights_step_impl(
+            self,
             step_number,
-            "finance.generate_ai_financial_insights",
+            step_start,
             llm_duration,
-            insight_duration,
-            total_duration,
+            action,
+            raw_args,
+            reason,
         )
-
-        llm_observation = {
-            "tool": observation.get("tool"),
-            "ok": observation.get("ok"),
-            "output_preview": observation.get("output_preview", ""),
-            "error": observation.get("error", ""),
-        }
-
-        self.messages.append(
-            {
-                "role": "assistant",
-                "content": json.dumps(action_for_history(action), ensure_ascii=False),
-            }
-        )
-        self.messages.append(
-            {
-                "role": "user",
-                "content": f"""
-Tool observation:
-{json.dumps(llm_observation, ensure_ascii=False)}
-
-{memory_state_text(self.memory, self.csv_path)}
-
-Continue. Choose exactly ONE next tool or final_answer.
-""",
-            }
-        )
-        self.prune_messages()
-
-        return None
 
     async def execute_tool_step(
         self,
