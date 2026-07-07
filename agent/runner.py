@@ -74,6 +74,7 @@ from agent.tool_args import (
     maybe_redirect_query_tool,
     missing_required_memory_for_tool,
     missing_required_query_args,
+    next_required_tool,
     normalize_args,
     normalize_query_tool_args,
 )
